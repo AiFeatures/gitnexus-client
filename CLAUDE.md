@@ -1,54 +1,35 @@
-<!-- version: 1.3.0 -->
-<!--
-  Metadata: version, last reviewed, scope, model policy, reference docs, changelog.
-  Last updated: 2026-03-22
--->
+# gitnexus-client — Claude Code Context
 
-Last reviewed: 2026-04-13
+## Overview
 
-**Project:** GitNexus · **Environment:** dev · **Maintainer:** repository maintainers (see GitHub)
+- **Repository**: AiFeatures/gitnexus-client
+- **Enterprise**: iAiFy
+- **Language**: TypeScript
+- **Upstream**: https://github.com/abhigyanpatwari/GitNexus
+- **Description**: Browser-side Graph RAG over git repositories (iAiFy fork of GitNexus)
 
-Follow **AGENTS.md** for the canonical rules; this file adds Claude Code–specific deltas. Cursor-specific notes live only in `AGENTS.md`.
+## Fork relationship
 
-## Scope
+iAiFy fork of `abhigyanpatwari/GitNexus`. Upstream merges run on a monthly/quarterly
+schedule per `Ai-road-4-You/governance/docs/runbooks/fork-upstream-merge.md`.
+We never push back to upstream.
 
-See the **Scope** table in [AGENTS.md](AGENTS.md) for read/write/execute/off-limits boundaries. Cursor-specific workflow notes also live only in AGENTS.md.
+On upstream merge: **always preserve** the iAiFy overlay files
+(`CLAUDE.md`, `AGENTS.md`, `.github/workflows/iaify-*.yml`,
+`.github/dependabot.yml`, `.github/copilot-instructions.md`).
 
-## Model Configuration
+## Conventions
 
-- **Primary:** Pin per **Claude Code** / Anthropic org policy (explicit model id). Do not rely on an unversioned `latest` alias for governed workflows.
-- **Fallback:** As configured in Claude Code (organization default or user override).
-- **Notes:** The GitNexus CLI analyzer does not call an LLM.
+- Conventional commits: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`
+- Kebab-case filenames for new files
+- Branch protection on main — PRs required
+- CODEOWNERS: @ashsolei
 
-## Execution Sequence (complex tasks)
+## Shared resources
 
-Same discipline as [AGENTS.md](AGENTS.md): before large multi-step work, state which **AGENTS.md** / **GUARDRAILS.md** rules apply, current **Scope**, and planned validation commands (`npm test`, `tsc`, etc.). When pausing, summarize progress in the chat or a **local** scratch file (do not add `HANDOFF.md` to the repo), then `/clear` and resume with that summary.
-
-## Claude Code hooks
-
-Prefer **PreToolUse** hooks for hard gates (e.g. tests before `git_commit`). Adapt hook commands to `gitnexus/` npm scripts.
-
-## Context budget
-
-If always-on instructions grow, load deep conventions via conditional reads (e.g. *“When writing new code, read STANDARDS.md”*) instead of pasting long blocks here. In Cursor, prefer `.cursor/index.mdc` plus optional `.cursor/rules/*.mdc` globs (see [AGENTS.md](AGENTS.md) § Context budget).
-
-## Reference Documentation
-
-- **This repository:** [AGENTS.md](AGENTS.md) (Cursor + monorepo notes), [ARCHITECTURE.md](ARCHITECTURE.md), [CONTRIBUTING.md](CONTRIBUTING.md), [GUARDRAILS.md](GUARDRAILS.md).
-- **Call-resolution DAG:** See ARCHITECTURE.md § Call-Resolution DAG. Shared pipeline code in `gitnexus/src/core/ingestion/` must not name languages — use `LanguageProvider` hooks instead (see AGENTS.md).
-- **GitNexus:** `.claude/skills/gitnexus/`; MCP and indexed-repo rules live only in [AGENTS.md](AGENTS.md) (`gitnexus:start` … `gitnexus:end`). See **GitNexus rules** below.
-
-## Changelog
-
-| Date | Version | Change |
-|------|---------|--------|
-| 2026-04-13 | 1.3.0 | Updated GitNexus index stats after DAG refactor. |
-| 2026-03-24 | 1.2.0 | Removed duplicated gitnexus:start block and scope table; replaced with pointers to AGENTS.md. |
-| 2026-03-23 | 1.1.0 | Updated agent instructions to match AGENTS.md. |
-| 2026-03-22 | 1.0.0 | Added structured header and changelog. |
-
----
-
-## GitNexus rules
-
-See the `<!-- gitnexus:start --> … <!-- gitnexus:end -->` block in **[AGENTS.md](AGENTS.md)** for the canonical MCP tools, impact analysis rules, and index instructions.
+| Asset | Location |
+|---|---|
+| CI/CD workflows | `Ai-road-4-You/enterprise-ci-cd@v1` |
+| Composite actions | `Ai-road-4-You/github-actions@v1` |
+| Governance | `Ai-road-4-You/governance` |
+| Repo templates | `Ai-road-4-You/repo-templates` |
