@@ -14,7 +14,13 @@ export function interpretGoImport(captures: CaptureMatch): ParsedImport | null {
   }
   if (kind === 'namespace') {
     if (name === undefined) return null;
-    return { kind: 'namespace', localName: name, importedName: name, targetRaw: source };
+    return {
+      kind: 'namespace',
+      localName: name,
+      importedName: name,
+      targetRaw: source,
+      implicitLocalName: true,
+    };
   }
   return null;
 }
@@ -29,8 +35,12 @@ export function interpretGoTypeBinding(captures: CaptureMatch): ParsedTypeBindin
   if (captures['@type-binding.self'] !== undefined) {
     source = 'self';
     // Preserve pointer shape on receiver self-bindings (`*T` vs `T`).
-    // Method-owner enrichment consumes that raw shape to model Go value and
-    // pointer receiver method sets conservatively.
+    // Method-owner enrichment consumes that raw shape to stamp `goReceiverKind`
+    // on each method. Since #2813 that stamp is metadata, NOT a filter:
+    // structural interface satisfaction counts pointer-receiver methods, because
+    // `*T`'s method set is what an interface-typed field actually holds. The
+    // preserved distinction is the hook a future value/pointer-aware model would
+    // read — do not reintroduce it as an exclusion.
     normalizedType = type.trim();
   } else if (captures['@type-binding.constructor'] !== undefined) {
     source = 'constructor-inferred';
@@ -79,11 +89,23 @@ export function interpretGoTypeBinding(captures: CaptureMatch): ParsedTypeBindin
   return { boundName: name, rawTypeName: normalizedType, source };
 }
 
+/** Shallow `map[K]V` spelling match — the key is anything up to the first `]`,
+ *  so a nested map key (`map[map[a]b]V`) is deliberately NOT recognised. Held
+ *  in one place so the capture-side normalizers and the resolver's element-type
+ *  hook cannot drift on what counts as a map spelling. */
+const GO_MAP_VALUE_RE = /^map\[[^\]]+\]\s*(.+)$/;
+
+/** `map[K]V` → `V`, trimmed. `undefined` when `text` is not a map spelling. */
+export function goMapValueType(text: string): string | undefined {
+  const match = GO_MAP_VALUE_RE.exec(text);
+  return match === null ? undefined : match[1].trim();
+}
+
 export function normalizeGoTypeName(text: string): string {
   let t = text.trim();
   t = stripGoOuterTypePrefixes(t);
-  const mapMatch = t.match(/^map\[[^\]]+\]\s*(.+)$/);
-  if (mapMatch) t = mapMatch[1].trim();
+  const mapValue = goMapValueType(t);
+  if (mapValue !== undefined) t = mapValue;
   t = stripGoOuterTypePrefixes(t.replace(/^(?:<-)?chan(?:<-)?\s+/, ''));
   if (t.startsWith('func(')) {
     const retMatch = t.match(/^func\([^)]*\)\s*(.*)$/);
@@ -111,8 +133,8 @@ export function normalizeGoReturnType(text: string): string {
     t = t.slice(1, closeIdx).trim();
   }
   t = stripGoOuterTypePrefixes(t);
-  const mapMatch = t.match(/^map\[[^\]]+\]\s*(.+)$/);
-  if (mapMatch) t = mapMatch[1].trim();
+  const mapValue = goMapValueType(t);
+  if (mapValue !== undefined) t = mapValue;
   t = stripGoOuterTypePrefixes(t.replace(/^(?:<-)?chan(?:<-)?\s+/, ''));
   if (t.startsWith('func(')) {
     const retMatch = t.match(/^func\([^)]*\)\s*(.*)$/);

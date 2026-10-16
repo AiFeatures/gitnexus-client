@@ -9,7 +9,7 @@
  *   3. bulk COPY column list     (getCopyQuery('BasicBlock'))
  *   4. single-node CREATE        (insertNodeToLbug)
  *   5. incremental MERGE         (batchInsertNodesToLbug)
- * plus the INCREMENTAL_SCHEMA_VERSION 2 → 3 bump (KTD5).
+ * plus its presence in the fingerprinted DDL set (KTD5).
  *
  * `calleeIds` is added LAST in the CSV/COPY/CREATE/MERGE tuple, so the column
  * order MUST stay identical across header, COPY list, and row array — the
@@ -24,8 +24,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GraphNode, NodeProperties } from 'gitnexus-shared';
 import { BASICBLOCK_CSV_HEADER, buildBasicBlockRow } from '../../src/core/lbug/csv-generator.js';
 import { getCopyQuery } from '../../src/core/lbug/lbug-adapter.js';
-import { BASICBLOCK_SCHEMA } from '../../src/core/lbug/schema.js';
-import { INCREMENTAL_SCHEMA_VERSION } from '../../src/storage/repo-manager.js';
+import { BASICBLOCK_SCHEMA, NODE_SCHEMA_QUERIES } from '../../src/core/lbug/schema.js';
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -56,11 +55,13 @@ const copyColumns = (copyQuery: string): string[] => {
 // ── 1. CSV header / row builder (pure) ────────────────────────────────────────
 
 describe('BasicBlock calleeIds — CSV header + row builder', () => {
-  it('header lists calleeIds LAST, after callees', () => {
-    expect(BASICBLOCK_CSV_HEADER).toBe('id,filePath,startLine,endLine,text,callees,calleeIds');
+  it('header keeps call identities and explicit owner in distinct columns', () => {
+    expect(BASICBLOCK_CSV_HEADER).toBe(
+      'id,filePath,startLine,endLine,text,callees,calleeIds,ownerId',
+    );
     const cols = BASICBLOCK_CSV_HEADER.split(',');
-    expect(cols[cols.length - 1]).toBe('calleeIds');
-    expect(cols[cols.length - 2]).toBe('callees');
+    expect(cols[cols.length - 1]).toBe('ownerId');
+    expect(cols[cols.length - 2]).toBe('calleeIds');
   });
 
   it('round-trip: calleeIds lands in the column the header names for it', () => {
@@ -75,7 +76,7 @@ describe('BasicBlock calleeIds — CSV header + row builder', () => {
     expect(rowCells).toHaveLength(headerCols.length);
     const calleeIdsIdx = headerCols.indexOf('calleeIds');
     const calleesIdx = headerCols.indexOf('callees');
-    // escapeCSVField always wraps the cell in double quotes; the space-joined
+    // Non-empty string fields are quoted; the space-joined
     // id list contains no comma, so the cell is a single CSV column.
     expect(rowCells[calleeIdsIdx]).toBe('"id1 id2"');
     expect(rowCells[calleesIdx]).toBe('"foo bar"');
@@ -86,7 +87,8 @@ describe('BasicBlock calleeIds — CSV header + row builder', () => {
     const headerCols = BASICBLOCK_CSV_HEADER.split(',');
     const rowCells = buildBasicBlockRow(node).split(',');
     const calleeIdsIdx = headerCols.indexOf('calleeIds');
-    expect(rowCells[calleeIdsIdx]).toBe('""');
+    // An absent string must stay unquoted so native COPY loads SQL NULL.
+    expect(rowCells[calleeIdsIdx]).toBe('');
     expect(rowCells[calleeIdsIdx]).not.toContain('undefined');
   });
 });
@@ -101,10 +103,10 @@ describe('BasicBlock calleeIds — header/COPY/row column parity', () => {
       basicBlock('BasicBlock:src/a.ts:0', { callees: 'foo', calleeIds: 'id1' }),
     ).split(',');
 
-    // Exact counts (the drift guard): 7 columns through and through.
-    expect(headerCols).toHaveLength(7);
-    expect(copyCols).toHaveLength(7);
-    expect(rowCells).toHaveLength(7);
+    // Exact counts protect every positional COPY writer.
+    expect(headerCols).toHaveLength(8);
+    expect(copyCols).toHaveLength(8);
+    expect(rowCells).toHaveLength(8);
     expect(copyCols).toHaveLength(headerCols.length);
     expect(rowCells).toHaveLength(headerCols.length);
   });
@@ -113,23 +115,25 @@ describe('BasicBlock calleeIds — header/COPY/row column parity', () => {
     const headerCols = BASICBLOCK_CSV_HEADER.split(',');
     const copyCols = copyColumns(getCopyQuery('BasicBlock', '/tmp/bb.csv'));
     expect(copyCols).toEqual(headerCols);
-    expect(copyCols[copyCols.length - 1]).toBe('calleeIds');
+    expect(copyCols[copyCols.length - 1]).toBe('ownerId');
   });
 });
 
-// ── 3. schema DDL + incremental version bump (pure) ───────────────────────────
+// ── 3. schema DDL + fingerprint coverage (pure) ───────────────────────────────
 
-describe('BasicBlock calleeIds — schema DDL + version bump', () => {
+describe('BasicBlock calleeIds — schema DDL + fingerprint coverage', () => {
   it('BASICBLOCK_SCHEMA declares the calleeIds STRING column', () => {
     expect(BASICBLOCK_SCHEMA).toContain('callees STRING');
     expect(BASICBLOCK_SCHEMA).toContain('calleeIds STRING');
   });
 
-  it('INCREMENTAL_SCHEMA_VERSION is at least 3 (calleeIds column bump, KTD5)', () => {
-    // The exact value advances as later milestones add re-index-forcing changes
-    // (v4 = CALL_SUMMARY, PDG FU-C). This guard pins the floor the calleeIds
-    // column established; the v3→4 reuse-gate guard lives in its own test.
-    expect(INCREMENTAL_SCHEMA_VERSION).toBeGreaterThanOrEqual(3);
+  it('the calleeIds column is inside the schema fingerprint, so a pre-column index cannot be reused', () => {
+    // This replaces the old `INCREMENTAL_SCHEMA_VERSION >= 3` floor (#2798).
+    // The hand-incremented integer is gone: reuse is now gated on a digest of
+    // the DDL itself, so the invariant to pin is that BASICBLOCK_SCHEMA is one
+    // of the strings that digest covers. An index built before the column
+    // existed therefore carries a different fingerprint and is rebuilt.
+    expect(NODE_SCHEMA_QUERIES).toContain(BASICBLOCK_SCHEMA);
   });
 });
 
@@ -176,6 +180,9 @@ const makeConfigMock = () => {
     resolveNativeSafeStorageDir: (p: string) => p,
     WAL_RECOVERY_SUGGESTION: 'run analyze --force',
     waitForWindowsHandleRelease: vi.fn(async () => true),
+    isStorageVersionMismatchError: vi.fn(() => false),
+    throwIfStorageVersionMismatch: vi.fn(),
+    STORAGE_VERSION_MISMATCH_SUGGESTION: '',
   };
   return { mock, queries };
 };
@@ -203,6 +210,7 @@ describe('BasicBlock calleeIds — CREATE / MERGE query strings', () => {
         text: 'foo();',
         callees: 'foo',
         calleeIds: 'id1 id2',
+        ownerId: 'Module:src/a.ts:program',
       },
       '/tmp/gitnexus-bb-create/lbug',
     );
@@ -212,7 +220,8 @@ describe('BasicBlock calleeIds — CREATE / MERGE query strings', () => {
     expect(createQuery).toBeDefined();
     expect(createQuery).toContain("calleeIds: 'id1 id2'");
     expect(createQuery).toContain("callees: 'foo'");
-    // calleeIds is the LAST assignment in the tuple (mirrors the column order).
+    expect(createQuery).toContain("ownerId: 'Module:src/a.ts:program'");
+    // Call identities follow callees in the persisted column order.
     expect(createQuery?.indexOf('calleeIds:')).toBeGreaterThan(
       createQuery?.indexOf('callees:') ?? -1,
     );
@@ -239,6 +248,7 @@ describe('BasicBlock calleeIds — CREATE / MERGE query strings', () => {
 
     const createQuery = queries.find((q) => q.startsWith('CREATE (n:BasicBlock'));
     expect(createQuery).toContain("calleeIds: ''");
+    expect(createQuery).toContain("ownerId: ''");
     expect(createQuery).not.toContain('calleeIds: undefined');
   });
 
@@ -260,6 +270,7 @@ describe('BasicBlock calleeIds — CREATE / MERGE query strings', () => {
             text: 'foo();',
             callees: 'foo',
             calleeIds: 'id1 id2',
+            ownerId: 'Module:src/a.ts:program',
           },
         },
       ],
@@ -272,6 +283,7 @@ describe('BasicBlock calleeIds — CREATE / MERGE query strings', () => {
     expect(mergeQuery).toContain('n.calleeIds');
     expect(mergeQuery).toContain("n.calleeIds = 'id1 id2'");
     expect(mergeQuery).toContain("n.callees = 'foo'");
+    expect(mergeQuery).toContain("n.ownerId = 'Module:src/a.ts:program'");
     expect(mergeQuery?.indexOf('n.calleeIds')).toBeGreaterThan(
       mergeQuery?.indexOf('n.callees') ?? -1,
     );
@@ -302,6 +314,7 @@ describe('BasicBlock calleeIds — CREATE / MERGE query strings', () => {
 
     const mergeQuery = queries.find((q) => q.startsWith('MERGE (n:BasicBlock'));
     expect(mergeQuery).toContain("n.calleeIds = ''");
+    expect(mergeQuery).toContain("n.ownerId = ''");
     expect(mergeQuery).not.toContain('n.calleeIds = undefined');
   });
 });

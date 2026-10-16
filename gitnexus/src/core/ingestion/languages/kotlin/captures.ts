@@ -18,10 +18,35 @@ import { normalizeKotlinType } from './interpret.js';
 import { synthesizeKotlinReceiverBinding } from './receiver-binding.js';
 import { getKotlinParser, getKotlinScopeQuery } from './query.js';
 import { markCompanionScope } from './companion-scopes.js';
-import { setKotlinClassAnnotationFacts, setKotlinSpringDiFacts } from './capture-side-channel.js';
+import {
+  setKotlinClassAnnotationFacts,
+  setKotlinSpringAopFacts,
+  setKotlinSpringConditionalFacts,
+  setKotlinSpringDiFacts,
+  setKotlinSpringDynamicLookupFacts,
+  setKotlinSpringMessageProducerFacts,
+  setKotlinSpringNonHttpHandlerFacts,
+  setKotlinSpringConfigConsumerFacts,
+} from './capture-side-channel.js';
 import { captureKotlinPackageFact } from './package-facts.js';
 import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
+import { synthesizeLombokAccessorCaptures } from './lombok-synthesizer.js';
 import { captureKotlinSpringDiClassFact, type KotlinSpringDiClassFact } from './spring-di.js';
+import { captureKotlinSpringConfigConsumerFacts } from './spring-config-bindings.js';
+import type { SpringDynamicLookupFact } from '../../frameworks/spring/dynamic-lookups.js';
+import { captureKotlinSpringDynamicLookupFact } from './spring-dynamic-lookup.js';
+import type { SpringMessageProducerFact } from '../../frameworks/spring/message-producers.js';
+import { captureKotlinSpringMessageProducerFact } from './spring-message-producers.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
+import { captureKotlinSpringAopFacts, type KotlinSpringAopFact } from './spring-aop.js';
+import {
+  captureKotlinSpringConditionalFacts,
+  type KotlinSpringConditionalFact,
+} from './spring-conditionals.js';
+import {
+  captureKotlinSpringNonHttpHandlerFacts,
+  type KotlinSpringNonHttpHandlerFact,
+} from './spring-non-http-handlers.js';
 
 const FUNCTION_DECL_TAGS = ['@declaration.function'] as const;
 
@@ -64,7 +89,47 @@ const KOTLIN_CALLABLE_CAPTURE_OPTIONS = {
     return destination === undefined || source === undefined ? undefined : { destination, source };
   },
   normalizeQualifiedName: (raw: string) => raw.replaceAll('::', '.'),
+  valueAlternatives: (node: SyntaxNode) => kotlinValueAlternatives(node),
 } as const;
+
+const isKotlinComment = (node: SyntaxNode): boolean =>
+  node.type === 'line_comment' || node.type === 'multiline_comment';
+
+const namedNonComments = (node: SyntaxNode): SyntaxNode[] =>
+  node.namedChildren.filter(
+    (child): child is SyntaxNode => child !== null && !isKotlinComment(child),
+  );
+
+/**
+ * Branches of a Kotlin value-selecting expression (#3354). `a ?: b` is a
+ * FIELDLESS `elvis_expression` (positional operands), so the shared
+ * field-based rule never saw it and only the last operand flowed. An
+ * `if_expression` fields its branches as `control_structure_body` wrappers:
+ * a bare branch (`if (c) ::f`) holds the expression directly, a braced one
+ * (`if (c) { ::f }`) nests it one level deeper in a `statements` node. A
+ * branch holding exactly one expression is that expression's value; an
+ * empty or multi-statement block, or an `if` without `else`, keeps the
+ * whole `if` one opaque source.
+ */
+function kotlinValueAlternatives(node: SyntaxNode): readonly SyntaxNode[] | undefined {
+  if (node.type === 'elvis_expression') {
+    const operands = namedNonComments(node);
+    return operands.length === 2 ? operands : undefined;
+  }
+  if (node.type !== 'if_expression') return undefined;
+  const branches: SyntaxNode[] = [];
+  for (const field of ['consequence', 'alternative'] as const) {
+    const body = node.childForFieldName(field);
+    if (body === null) return [node];
+    let values = namedNonComments(body);
+    const [block] = values;
+    if (values.length === 1 && block?.type === 'statements') values = namedNonComments(block);
+    const [value] = values;
+    if (values.length !== 1 || value === undefined) return [node];
+    branches.push(value);
+  }
+  return branches;
+}
 
 export function emitKotlinScopeCaptures(
   sourceText: string,
@@ -84,8 +149,16 @@ export function emitKotlinScopeCaptures(
 
   const out: CaptureMatch[] = [];
   const classAnnotations = new Map<ScopeId, Set<string>>();
+  const springAopFacts: KotlinSpringAopFact[] = [];
+  const springAopTypeNodeIds = new Set<number>();
+  const springConditionalFacts: KotlinSpringConditionalFact[] = [];
   const springDiFacts: KotlinSpringDiClassFact[] = [];
+  const springNonHttpHandlerFacts: KotlinSpringNonHttpHandlerFact[] = [];
+  const springNonHttpHandlerTypeNodeIds = new Set<number>();
   const springDiClassNodeIds = new Set<number>();
+  const springDynamicLookupFacts: SpringDynamicLookupFact[] = [];
+  const springMessageProducerFacts: SpringMessageProducerFact[] = [];
+  const springMemberCallNodeIds = new Set<number>();
   const returnTypes = collectKotlinReturnTypeTexts(tree.rootNode);
   out.push(...synthesizeKotlinLocalAssignmentBindings(tree.rootNode, returnTypes));
   out.push(...synthesizeKotlinLoopBindings(tree.rootNode, returnTypes));
@@ -109,9 +182,43 @@ export function emitKotlinScopeCaptures(
     }
     if (Object.keys(grouped).length === 0) continue;
 
+    // One visit per member call node: the same invocation can back several
+    // query matches, and both Spring call-shape captures must see it once.
+    const memberCallNode = nodeIfType(groupedNodes['@reference.call.member'], 'call_expression');
+    if (memberCallNode !== null && !springMemberCallNodeIds.has(memberCallNode.id)) {
+      springMemberCallNodeIds.add(memberCallNode.id);
+      const lookupFact = captureKotlinSpringDynamicLookupFact(memberCallNode, filePath);
+      if (lookupFact !== null) springDynamicLookupFacts.push(lookupFact);
+      const producerFact = captureKotlinSpringMessageProducerFact(memberCallNode, filePath);
+      if (producerFact !== null) springMessageProducerFacts.push(producerFact);
+    }
+
+    // tree-sitter-kotlin represents both classes and interfaces with
+    // `class_declaration`; `object_declaration` is the separate object form.
+    const springAopTypeNode = [
+      nodeIfType(groupedNodes['@scope.class'], 'class_declaration'),
+      nodeIfType(groupedNodes['@scope.class'], 'object_declaration'),
+      nodeIfType(groupedNodes['@scope.class'], 'companion_object'),
+    ].find((node): node is SyntaxNode => node !== null);
+    if (springAopTypeNode !== undefined) {
+      if (!springAopTypeNodeIds.has(springAopTypeNode.id)) {
+        springAopTypeNodeIds.add(springAopTypeNode.id);
+        springAopFacts.push(...captureKotlinSpringAopFacts(springAopTypeNode, filePath));
+      }
+      if (!springNonHttpHandlerTypeNodeIds.has(springAopTypeNode.id)) {
+        springNonHttpHandlerTypeNodeIds.add(springAopTypeNode.id);
+        springNonHttpHandlerFacts.push(
+          ...captureKotlinSpringNonHttpHandlerFacts(springAopTypeNode, filePath),
+        );
+      }
+    }
+
     const springDiClassNode = nodeIfType(groupedNodes['@scope.class'], 'class_declaration');
     if (springDiClassNode !== null && !springDiClassNodeIds.has(springDiClassNode.id)) {
       springDiClassNodeIds.add(springDiClassNode.id);
+      springConditionalFacts.push(
+        ...captureKotlinSpringConditionalFacts(springDiClassNode, filePath),
+      );
       const fact = captureKotlinSpringDiClassFact(springDiClassNode, filePath);
       if (fact !== null) springDiFacts.push(fact);
     }
@@ -169,13 +276,40 @@ export function emitKotlinScopeCaptures(
     // `@reference.callable`. Rewrite into a call reference so it participates
     // in call-graph resolution: a bare `::member` resolves as a free call;
     // a `Receiver::member` resolves as a member call against the receiver
-    // type. The function/constructor is referenced (not invoked), so no
-    // arity/argument metadata is attached.
+    // type. A free reference's explicit function type can constrain arity;
+    // otherwise there are no invocation arguments to infer it from.
     if (grouped['@reference.callable'] !== undefined) {
       const nameCap = grouped['@reference.name'];
       const callableNode = groupedNodes['@reference.callable'];
       if (nameCap !== undefined && callableNode !== undefined) {
         const receiverCap = grouped['@reference.receiver'];
+        const declaration = callableNode.parent;
+        const variable =
+          declaration?.type === 'property_declaration'
+            ? declaration.namedChildren.find((child) => child.type === 'variable_declaration')
+            : undefined;
+        const expectedType = variable?.namedChildren.find(
+          (child) => child.type === 'function_type',
+        );
+        const expectedParameters = expectedType?.namedChildren.find(
+          (child) => child.type === 'function_type_parameters',
+        );
+        // A typed callable reference carries its expected function arity even
+        // though it has no invocation arguments. Let the existing overload
+        // resolver use that semantic constraint, rather than inventing a call.
+        const arity =
+          receiverCap === undefined &&
+          expectedParameters &&
+          expectedType &&
+          namedNonComments(expectedType)[0]?.id === expectedParameters.id
+            ? {
+                '@reference.arity': syntheticCapture(
+                  '@reference.arity',
+                  callableNode,
+                  String(namedNonComments(expectedParameters).length),
+                ),
+              }
+            : {};
         // The anchor Capture must carry the call-form tag as its `name` —
         // the scope-extractor reads `Capture.name` (not the map key) to
         // classify the reference kind, so re-wrap via nodeToCapture rather
@@ -186,15 +320,43 @@ export function emitKotlinScopeCaptures(
             '@reference.call.member': nodeToCapture('@reference.call.member', callableNode),
             '@reference.name': nameCap,
             '@reference.receiver': receiverCap,
+            ...arity,
           });
         } else {
           out.push({
             '@reference.call.free': nodeToCapture('@reference.call.free', callableNode),
             '@reference.name': nameCap,
+            ...arity,
           });
         }
       }
       continue;
+    }
+
+    if (grouped['@reference.write.member'] !== undefined) {
+      const assignment = groupedNodes['@reference.write.member'];
+      const target = assignment?.firstNamedChild;
+      const receiver = groupedNodes['@reference.receiver'];
+      const name = groupedNodes['@reference.name'];
+      if (target?.type === 'directly_assignable_expression' && receiver && name) {
+        // Assignment chains are flat in this grammar. The query can pair any
+        // preceding child with any suffix; only the base starts a receiver.
+        if (receiver.id !== target.firstNamedChild?.id) continue;
+        const suffix = name.parent;
+        if (!suffix) continue;
+        const prefix = target.text.slice(0, suffix.startIndex - target.startIndex);
+        grouped['@reference.receiver'] = syntheticCapture('@reference.receiver', receiver, prefix);
+        // The original capture names only the base, not this reconstructed
+        // prefix. Do not later encode that shorter AST as the full receiver.
+        delete groupedNodes['@reference.receiver'];
+        if (suffix.id !== target.lastNamedChild?.id) {
+          delete grouped['@reference.write.member'];
+          grouped['@reference.read.member'] = nodeToCapture('@reference.read.member', suffix);
+          // Prefixes are reads, but are not nested navigation_expression nodes.
+          out.push(grouped);
+          continue;
+        }
+      }
     }
 
     if (
@@ -234,6 +396,12 @@ export function emitKotlinScopeCaptures(
     }
 
     if (grouped['@scope.function'] !== undefined) {
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, groupedNodes['@reference.receiver']);
       out.push(grouped);
       const fnNode = nodeIfType(groupedNodes['@scope.function'], 'function_declaration');
       if (fnNode !== null) {
@@ -291,6 +459,12 @@ export function emitKotlinScopeCaptures(
       }
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, groupedNodes['@reference.receiver']);
     out.push(grouped);
 
     const extensionFallback = extensionFreeCallFallback(grouped, groupedNodes);
@@ -298,7 +472,17 @@ export function emitKotlinScopeCaptures(
   }
 
   setKotlinClassAnnotationFacts(filePath, materializeClassAnnotationFacts(classAnnotations));
+  setKotlinSpringAopFacts(filePath, springAopFacts);
+  setKotlinSpringConditionalFacts(filePath, springConditionalFacts);
   setKotlinSpringDiFacts(filePath, springDiFacts);
+  setKotlinSpringDynamicLookupFacts(filePath, springDynamicLookupFacts);
+  setKotlinSpringNonHttpHandlerFacts(filePath, springNonHttpHandlerFacts);
+  setKotlinSpringConfigConsumerFacts(
+    filePath,
+    captureKotlinSpringConfigConsumerFacts(tree.rootNode, filePath),
+  );
+  setKotlinSpringMessageProducerFacts(filePath, springMessageProducerFacts);
+  out.push(...synthesizeLombokAccessorCaptures(tree.rootNode));
   out.push(...synthesizeCallableFlowCaptures(tree.rootNode, KOTLIN_CALLABLE_CAPTURE_OPTIONS));
   return out;
 }

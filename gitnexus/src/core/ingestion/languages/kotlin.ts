@@ -8,6 +8,7 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import { kotlinRenameProvider } from './kotlin/rename.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { kotlinClassConfig } from '../class-extractors/configs/jvm.js';
 import { defineLanguage } from '../language-provider.js';
@@ -24,6 +25,10 @@ import type { SyntaxNode } from '../utils/ast-helpers.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { kotlinCallConfig } from '../call-extractors/configs/jvm.js';
 import { createKotlinCfgVisitor } from '../cfg/visitors/kotlin.js';
+import {
+  getKotlinSpringMessageProducerFacts,
+  getKotlinSpringNonHttpHandlerFacts,
+} from './kotlin/capture-side-channel.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { kotlinConfig } from '../field-extractors/configs/jvm.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
@@ -41,6 +46,16 @@ import {
   kotlinMergeBindings,
   kotlinReceiverBinding,
 } from './kotlin/index.js';
+import { synthesizeLombokAccessors } from './kotlin/lombok-synthesizer.js';
+import {
+  extractKotlinRuntimeSymbolProperties,
+  kotlinRuntimeSymbolStrategy,
+} from './kotlin/spring-actuator.js';
+import { extractKotlinSpringRoutes } from '../route-extractors/kotlin-spring.js';
+import {
+  extractKotlinModuleConstants,
+  foldKotlinOperands,
+} from '../route-extractors/kotlin-const-resolver.js';
 
 /** Check if a Kotlin function_declaration capture is inside a class_body (i.e., a method).
  *  Kotlin grammar uses function_declaration for both top-level functions and class methods.
@@ -116,6 +131,7 @@ const BUILT_INS: ReadonlySet<string> = new Set([
 ]);
 
 export const kotlinProvider = defineLanguage({
+  rename: kotlinRenameProvider,
   id: SupportedLanguages.Kotlin,
   extensions: ['.kt', '.kts'],
   entryPointPatterns: [
@@ -174,6 +190,8 @@ export const kotlinProvider = defineLanguage({
 
   // ── KDoc → description (issue #2270) ──
   descriptionExtractor: createLeadingDocDescriptionExtractor(),
+  definitionPropertiesExtractor: extractKotlinRuntimeSymbolProperties,
+  runtimeSymbolStrategy: kotlinRuntimeSymbolStrategy,
 
   labelOverride: (functionNode, defaultLabel) => {
     if (defaultLabel !== 'Function') return defaultLabel;
@@ -202,4 +220,23 @@ export const kotlinProvider = defineLanguage({
   mergeBindings: (_scope, bindings) => kotlinMergeBindings(bindings),
   receiverBinding: kotlinReceiverBinding,
   arityCompatibility: kotlinArityCompatibility,
+  synthesizeStructureMembers: synthesizeLombokAccessors,
+
+  // ── Spring decorator routes + composed path constants (#3130) ──
+  extractDecoratorRoutes: extractKotlinSpringRoutes,
+  extractModuleConstants: extractKotlinModuleConstants,
+  foldRoutePathOperands: foldKotlinOperands,
+
+  // Async messaging facts for the `springDestinations` phase. Both stores are
+  // repopulated on the main thread by `applyKotlinCaptureSideChannel`, so this
+  // answers for cache hits and misses alike.
+  getSpringMessagingFacts: (filePath) => ({
+    handlers: getKotlinSpringNonHttpHandlerFacts(filePath),
+    producers: getKotlinSpringMessageProducerFacts(filePath),
+  }),
+  // Kotlin string literals interpolate: `"orders-$env"` and `"orders-${env}"`
+  // are string templates, and a Spring property placeholder has to escape the
+  // dollar (`"\${app.topic}"`). Destination resolution needs this to keep a
+  // runtime template out of the address namespace.
+  interpolatesStringLiterals: true,
 });

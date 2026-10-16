@@ -1,10 +1,22 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { AnalyzeUploadDeps } from '../../src/server/analyze-upload.js';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import type { IncomingMessage } from 'node:http';
 import { createAnalyzeUploadHandler } from '../../src/server/analyze-upload.js';
-import { requireLocalhostOrigin, createLocalhostOriginGuard } from '../../src/server/middleware.js';
+import { PUBLIC_ORIGIN_ENV, createWriteOriginGuard } from '../../src/server/middleware.js';
+
+// The guard admits GITNEXUS_PUBLIC_ORIGIN as well as loopback, and the
+// rejection cases below assume none is configured. Clear the developer's
+// ambient value for the file rather than inheriting it.
+const ambientPublicOrigin = process.env[PUBLIC_ORIGIN_ENV];
+beforeAll(() => {
+  delete process.env[PUBLIC_ORIGIN_ENV];
+});
+afterAll(() => {
+  if (ambientPublicOrigin !== undefined) process.env[PUBLIC_ORIGIN_ENV] = ambientPublicOrigin;
+});
 
 const BOUNDARY = '----gitnexusuploadtest';
 
@@ -77,8 +89,13 @@ function uniqueTop(): string {
 describe('createAnalyzeUploadHandler', () => {
   it('ingests, promotes the inner folder, and launches analysis (202)', async () => {
     const top = uniqueTop();
-    const createJob = vi.fn(() => ({ id: 'job-1', status: 'queued' }));
-    const launch = vi.fn((_j, dir: string) => promoted.push(dir));
+    const createJob = vi.fn<AnalyzeUploadDeps['createJob']>(() => ({
+      id: 'job-1',
+      status: 'queued',
+    }));
+    const launch = vi.fn<AnalyzeUploadDeps['launch']>((_j, dir) => {
+      promoted.push(dir);
+    });
     const failJob = vi.fn();
     const handler = createAnalyzeUploadHandler({ createJob, launch, failJob });
 
@@ -107,10 +124,12 @@ describe('createAnalyzeUploadHandler', () => {
 
   it('maps a busy job (createJob throws "already in progress") to 409 and promotes nothing', async () => {
     const top = uniqueTop();
-    const createJob = vi.fn(() => {
+    const createJob = vi.fn<AnalyzeUploadDeps['createJob']>(() => {
       throw new Error('Analysis already in progress for another repository');
     });
-    const launch = vi.fn((_j, dir: string) => promoted.push(dir));
+    const launch = vi.fn<AnalyzeUploadDeps['launch']>((_j, dir) => {
+      promoted.push(dir);
+    });
     const failJob = vi.fn();
     const handler = createAnalyzeUploadHandler({ createJob, launch, failJob });
 
@@ -131,8 +150,8 @@ describe('createAnalyzeUploadHandler', () => {
   });
 
   it('rejects a traversal path in the manifest (400) without launching', async () => {
-    const createJob = vi.fn(() => ({ id: 'j', status: 'queued' }));
-    const launch = vi.fn();
+    const createJob = vi.fn<AnalyzeUploadDeps['createJob']>(() => ({ id: 'j', status: 'queued' }));
+    const launch = vi.fn<AnalyzeUploadDeps['launch']>();
     const failJob = vi.fn();
     const handler = createAnalyzeUploadHandler({ createJob, launch, failJob });
 
@@ -151,8 +170,8 @@ describe('createAnalyzeUploadHandler', () => {
   });
 
   it('rejects an un-nameable top folder (Windows-reserved → 400)', async () => {
-    const createJob = vi.fn(() => ({ id: 'j', status: 'queued' }));
-    const launch = vi.fn();
+    const createJob = vi.fn<AnalyzeUploadDeps['createJob']>(() => ({ id: 'j', status: 'queued' }));
+    const launch = vi.fn<AnalyzeUploadDeps['launch']>();
     const failJob = vi.fn();
     const handler = createAnalyzeUploadHandler({ createJob, launch, failJob });
 
@@ -171,8 +190,13 @@ describe('createAnalyzeUploadHandler', () => {
 
   it('strips a crafted .gitnexus index from the promoted upload', async () => {
     const top = uniqueTop();
-    const createJob = vi.fn(() => ({ id: 'job-x', status: 'queued' }));
-    const launch = vi.fn((_j, dir: string) => promoted.push(dir));
+    const createJob = vi.fn<AnalyzeUploadDeps['createJob']>(() => ({
+      id: 'job-x',
+      status: 'queued',
+    }));
+    const launch = vi.fn<AnalyzeUploadDeps['launch']>((_j, dir) => {
+      promoted.push(dir);
+    });
     const failJob = vi.fn();
     const handler = createAnalyzeUploadHandler({ createJob, launch, failJob });
 
@@ -193,8 +217,8 @@ describe('createAnalyzeUploadHandler', () => {
   });
 
   it('rejects a single-segment manifest before creating a job (no slot taken)', async () => {
-    const createJob = vi.fn(() => ({ id: 'j', status: 'queued' }));
-    const launch = vi.fn();
+    const createJob = vi.fn<AnalyzeUploadDeps['createJob']>(() => ({ id: 'j', status: 'queued' }));
+    const launch = vi.fn<AnalyzeUploadDeps['launch']>();
     const failJob = vi.fn();
     const handler = createAnalyzeUploadHandler({ createJob, launch, failJob });
 
@@ -213,8 +237,8 @@ describe('createAnalyzeUploadHandler', () => {
   });
 
   it('rejects a multi-top-folder manifest (would silently drop folders)', async () => {
-    const createJob = vi.fn(() => ({ id: 'j', status: 'queued' }));
-    const launch = vi.fn();
+    const createJob = vi.fn<AnalyzeUploadDeps['createJob']>(() => ({ id: 'j', status: 'queued' }));
+    const launch = vi.fn<AnalyzeUploadDeps['launch']>();
     const failJob = vi.fn();
     const handler = createAnalyzeUploadHandler({ createJob, launch, failJob });
 
@@ -234,9 +258,12 @@ describe('createAnalyzeUploadHandler', () => {
 
   it('releases the single slot (failJob) when a step fails after createJob', async () => {
     const top = uniqueTop();
-    const createJob = vi.fn(() => ({ id: 'job-fail', status: 'queued' }));
+    const createJob = vi.fn<AnalyzeUploadDeps['createJob']>(() => ({
+      id: 'job-fail',
+      status: 'queued',
+    }));
     // launch throws AFTER createJob + promote — the slot must be released.
-    const launch = vi.fn((_j, dir: string) => {
+    const launch = vi.fn<AnalyzeUploadDeps['launch']>((_j, dir: string) => {
       promoted.push(dir);
       throw new Error('worker fork blew up');
     });
@@ -258,7 +285,7 @@ describe('createAnalyzeUploadHandler', () => {
   });
 });
 
-describe('requireLocalhostOrigin', () => {
+describe('createWriteOriginGuard (no bound host)', () => {
   function call(origin: string | undefined): { passed: boolean; status: number } {
     let passed = false;
     let status = 0;
@@ -269,7 +296,7 @@ describe('requireLocalhostOrigin', () => {
         return { json: () => {} };
       },
     } as never;
-    requireLocalhostOrigin(req, res, () => {
+    createWriteOriginGuard()(req, res, () => {
       passed = true;
     });
     return { passed, status };
@@ -288,7 +315,7 @@ describe('requireLocalhostOrigin', () => {
     expect(r.status).toBe(403);
   });
 
-  it('rejects RFC1918 origins when no boundHost is set (default guard)', () => {
+  it('rejects RFC1918 origins when no boundHost is set', () => {
     expect(call('http://10.0.0.1:4173').passed).toBe(false);
     expect(call('http://172.16.1.21:4173').passed).toBe(false);
     expect(call('http://192.168.1.100:4173').passed).toBe(false);
@@ -301,12 +328,12 @@ describe('requireLocalhostOrigin', () => {
   });
 });
 
-describe('createLocalhostOriginGuard (bound host)', () => {
+describe('createWriteOriginGuard (bound host)', () => {
   function callWith(
     boundHost: string,
     origin: string | undefined,
   ): { passed: boolean; status: number; body?: { error?: string; code?: string } } {
-    const guard = createLocalhostOriginGuard(boundHost);
+    const guard = createWriteOriginGuard(boundHost);
     let passed = false;
     let status = 0;
     let body: { error?: string; code?: string } | undefined;

@@ -16,6 +16,7 @@ import {
 } from '../utils/ast-helpers.js';
 import type { NodeLabel } from 'gitnexus-shared';
 import { SupportedLanguages } from 'gitnexus-shared';
+import { dartRenameProvider } from './dart/rename.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { dartClassConfig } from '../class-extractors/configs/dart.js';
 import { defineLanguage } from '../language-provider.js';
@@ -36,6 +37,7 @@ import { createCallExtractor } from '../call-extractors/generic.js';
 import { dartCallConfig } from '../call-extractors/configs/dart.js';
 import {
   emitDartScopeCaptures,
+  dartScopeOwnsReceivers,
   interpretDartImport,
   interpretDartTypeBinding,
   dartBindingScopeFor,
@@ -81,6 +83,7 @@ const dartEnclosingFunctionFinder = (
 };
 
 export const dartProvider = defineLanguage({
+  rename: dartRenameProvider,
   id: SupportedLanguages.Dart,
   extensions: ['.dart'],
   entryPointPatterns: [
@@ -139,6 +142,11 @@ export const dartProvider = defineLanguage({
   // emit-side `ScopeResolver` lives in `dart/scope-resolver.ts`; the same
   // function references flow through both interfaces.
   emitScopeCaptures: emitDartScopeCaptures,
+  // Dart's `ownsReceivers` masks FIELD NAMES a member body rebinds, not `this`
+  // (which Dart binds lexically in every closure form, so there is nothing to
+  // own). See `dartShadowedFieldsCapture` in `dart/captures.ts` for why the
+  // read side needs the mask and what it deliberately does not cover.
+  scopeOwnsReceivers: dartScopeOwnsReceivers,
   cfgVisitor: createDartCfgVisitor(),
   interpretImport: interpretDartImport,
   interpretTypeBinding: interpretDartTypeBinding,

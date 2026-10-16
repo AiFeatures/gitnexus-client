@@ -1757,7 +1757,11 @@ describe('C++ template specialization disambiguation across files', () => {
       expect(targetOwnerEdge).toBeDefined();
       expect(sourceOwnerEdge!.rel.sourceId).toBe(targetOwnerEdge!.rel.sourceId);
       const ownerNode = result.graph.getNode(sourceOwnerEdge!.rel.sourceId);
-      const fp = ownerNode?.properties.templateArguments?.join(',');
+      const templateArguments = ownerNode?.properties.templateArguments;
+      if (templateArguments != null && !Array.isArray(templateArguments)) {
+        throw new Error('Expected template arguments to be an array');
+      }
+      const fp = Array.isArray(templateArguments) ? templateArguments.join(',') : undefined;
       if (fp) ownerFingerprints.add(fp);
     }
     expect(ownerFingerprints).toEqual(new Set(['User', 'Order']));
@@ -2125,14 +2129,15 @@ describe('C++ ambiguous integer-width overloads', () => {
   });
 
   it('records a structured suppression reason for normalization ambiguity', () => {
-    const outcomes = getResolutionOutcomes(result).filter(
-      (o) =>
-        o.kind === 'suppressed' &&
-        o.name === 'process' &&
-        o.phase === 'receiver-bound-calls' &&
-        o.filePath.endsWith('caller.cpp') &&
-        o.reason === 'overload-ambiguous-normalization',
-    );
+    const outcomes = getResolutionOutcomes(result)
+      .filter((o) => o.kind === 'suppressed')
+      .filter(
+        (o) =>
+          o.name === 'process' &&
+          o.phase === 'receiver-bound-calls' &&
+          o.filePath.endsWith('caller.cpp') &&
+          o.reason === 'overload-ambiguous-normalization',
+      );
 
     expect(outcomes.length).toBeGreaterThan(0);
     expect(outcomes[0]?.candidateIds.length).toBe(2);
@@ -2214,13 +2219,12 @@ describe('C++ overload resolution — conversion-rank disambiguation (#1578)', (
   });
 
   it('records a structured suppression reason for conversion-rank ties', () => {
-    const outcomes = getResolutionOutcomes(result).filter(
-      (o) =>
-        o.kind === 'suppressed' &&
-        o.name === 'h' &&
-        o.phase === 'free-call-fallback' &&
-        o.reason === 'conversion-rank-tied',
-    );
+    const outcomes = getResolutionOutcomes(result)
+      .filter((o) => o.kind === 'suppressed')
+      .filter(
+        (o) =>
+          o.name === 'h' && o.phase === 'free-call-fallback' && o.reason === 'conversion-rank-tied',
+      );
 
     expect(outcomes.length).toBeGreaterThan(0);
     expect(outcomes[0]?.candidateIds.length).toBe(2);
@@ -2724,6 +2728,18 @@ describe('C++ two-phase template lookup — dependent-base deep nesting suppress
     const leaks = calls.filter((c) => c.source === 'g' && c.target === 'f');
     expect(leaks.length).toBe(0);
   });
+
+  // The base is `ns::a::b::Inner`, and this fixture deliberately also declares a
+  // global-scope `Inner` to force the multi-candidate path. `resolveDefGraphId`
+  // must reach the deep node, not the global decoy: the scope-extractor leaves
+  // the base's `qualifiedName` a bare `Inner` with the path on `namespacePrefix`,
+  // so only the namespace-prefixed key can distinguish them, and it has to be
+  // tried BEFORE the bare key or the decoy answers first (#2745 review — the
+  // reorder that fixed this was previously unpinned by any assertion).
+  it('EXTENDS anchors on the deep ns.a.b.Inner, not the global Inner decoy', () => {
+    const extendsEdges = getRelationships(result, 'EXTENDS').filter((e) => e.source === 'Derived');
+    expect(extendsEdges).toMatchObject([{ rel: { targetId: 'Struct:lib.h:ns.a.b.Inner' } }]);
+  });
 });
 
 describe('C++ two-phase template lookup — dependent-base sibling-namespace suppression', () => {
@@ -2872,7 +2888,7 @@ describe('C++ ADL — base-class associated namespaces', () => {
     expect(logCalls.length).toBe(1);
     expect(logCalls[0].targetFilePath).toContain('base_lib.h');
     const targetNode = result.graph.getNode(logCalls[0].rel.targetId);
-    expect(logCalls[0].rel.targetId).toBe('Function:base_lib.h:log');
+    expect(logCalls[0].rel.targetId).toBe('Function:base_lib.h:log#1~Base');
     expect(targetNode?.properties.parameterTypes).toEqual(['Base']);
   });
 
@@ -2882,7 +2898,7 @@ describe('C++ ADL — base-class associated namespaces', () => {
     expect(traceCalls.length).toBe(1);
     expect(traceCalls[0].targetFilePath).toContain('base_lib.h');
     const targetNode = result.graph.getNode(traceCalls[0].rel.targetId);
-    expect(traceCalls[0].rel.targetId).toBe('Function:base_lib.h:trace');
+    expect(traceCalls[0].rel.targetId).toBe('Function:base_lib.h:trace#1~Root');
     expect(targetNode?.properties.parameterTypes).toEqual(['Root']);
   });
 
@@ -2892,7 +2908,7 @@ describe('C++ ADL — base-class associated namespaces', () => {
     expect(pingCalls.length).toBe(1);
     expect(pingCalls[0].targetFilePath).toContain('base_lib.h');
     const targetNode = result.graph.getNode(pingCalls[0].rel.targetId);
-    expect(pingCalls[0].rel.targetId).toBe('Function:base_lib.h:ping');
+    expect(pingCalls[0].rel.targetId).toBe('Function:base_lib.h:ping#1~DiamondBase');
     expect(targetNode?.properties.parameterTypes).toEqual(['DiamondBase']);
   });
 });
@@ -3244,13 +3260,14 @@ describe('C++ ADL — non-function ordinary lookup suppresses ADL', () => {
   });
 
   it('records a structured suppression reason for ADL blocker lookup', () => {
-    const outcomes = getResolutionOutcomes(result).filter(
-      (o) =>
-        o.kind === 'suppressed' &&
-        o.name === 'record' &&
-        o.phase === 'free-call-fallback' &&
-        o.reason === 'adl-ordinary-lookup-blocked',
-    );
+    const outcomes = getResolutionOutcomes(result)
+      .filter((o) => o.kind === 'suppressed')
+      .filter(
+        (o) =>
+          o.name === 'record' &&
+          o.phase === 'free-call-fallback' &&
+          o.reason === 'adl-ordinary-lookup-blocked',
+      );
 
     expect(outcomes.length).toBeGreaterThan(0);
     expect(outcomes[0]?.candidateIds.length).toBe(0);
@@ -3540,13 +3557,14 @@ describe('C++ inline namespace — ambiguous same-name across inline children (#
   });
 
   it('records a structured suppression reason for inline namespace ambiguity', () => {
-    const outcomes = getResolutionOutcomes(result).filter(
-      (o) =>
-        o.kind === 'suppressed' &&
-        o.name === 'foo' &&
-        o.phase === 'receiver-bound-calls' &&
-        o.reason === 'inline-ns-ambiguous',
-    );
+    const outcomes = getResolutionOutcomes(result)
+      .filter((o) => o.kind === 'suppressed')
+      .filter(
+        (o) =>
+          o.name === 'foo' &&
+          o.phase === 'receiver-bound-calls' &&
+          o.reason === 'inline-ns-ambiguous',
+      );
 
     expect(outcomes.length).toBeGreaterThan(0);
     expect(outcomes[0]?.candidateIds.length).toBe(0);
@@ -4534,5 +4552,35 @@ describe('C++ deleted overload selection (#1893 A2)', () => {
       'select',
       'touch',
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structural receiver typing for a `->` base receiver.
+//
+// The all-language rollout is proven behaviourally for TypeScript only; this is
+// the second language, and the one the rollout measurably changed: C++
+// `svc->getUser()->save()` emitted NO edge and recorded NO drop before it.
+// ---------------------------------------------------------------------------
+
+describe('C++ structural receiver chain through a pointer base', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'cpp-receiver-chain-arrow'), () => {});
+  }, 60000);
+
+  it('resolves svc->getUser()->save() — the `->` base the text cascade could not parse', () => {
+    const calls = getRelationships(result, 'CALLS');
+    expect(
+      calls.find((c) => c.source === 'pointerArrowChain' && c.target === 'save'),
+    ).toMatchObject({ target: 'save' });
+  });
+
+  it('keeps the value-dot base resolving (control — worked before this work)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    expect(calls.find((c) => c.source === 'valueDotChain' && c.target === 'save')).toMatchObject({
+      target: 'save',
+    });
   });
 });

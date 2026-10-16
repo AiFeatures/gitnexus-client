@@ -6,6 +6,7 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import { swiftRenameProvider } from './swift/rename.js';
 import type { NodeLabel, SymbolDefinition } from 'gitnexus-shared';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { swiftClassConfig } from '../class-extractors/configs/swift.js';
@@ -37,6 +38,7 @@ import {
   swiftMergeBindings,
   swiftArityCompatibility,
 } from './swift/index.js';
+import { preprocessSwiftConditionalDirectives } from './swift/conditional-directive-preprocess.js';
 
 /** Swift init/deinit declarations have special names and Constructor label. */
 const swiftExtractFunctionName = (
@@ -176,8 +178,10 @@ const BUILT_INS: ReadonlySet<string> = new Set([
 ]);
 
 export const swiftProvider = defineLanguage({
+  rename: swiftRenameProvider,
   id: SupportedLanguages.Swift,
   extensions: ['.swift'],
+  preprocessSource: preprocessSwiftConditionalDirectives,
   entryPointPatterns: [
     /^viewDidLoad$/,
     /^viewWillAppear$/,

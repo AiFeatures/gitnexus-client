@@ -27,6 +27,7 @@
 import type { ParsedFile } from 'gitnexus-shared';
 import { extract as extractScope } from './scope-extractor.js';
 import type { LanguageProvider } from './language-provider.js';
+import type { NotebookLineSegment } from './ipynb-extractor.js';
 
 import { logger } from '../logger.js';
 /** Callback used to report scope-extraction warnings to the host (worker or direct). */
@@ -45,17 +46,46 @@ export function extractParsedFile(
   onWarn?: ScopeBridgeWarn,
   cachedTree?: unknown,
   sourceKind: ScopeCaptureSourceKind = 'full-file',
+  notebookSegments?: readonly NotebookLineSegment[],
+  lineOffset?: number,
+  scriptLanguage?: string,
+  sourceLineMap?: readonly number[],
 ): ParsedFile | undefined {
   if (provider.emitScopeCaptures === undefined) return undefined;
   if (sourceText.trim().length === 0) return undefined;
   try {
-    const captures = provider.emitScopeCaptures(sourceText, filePath, cachedTree, { sourceKind });
+    // A provider that rewrites source before parsing must see the same text
+    // here that the parse worker fed tree-sitter, or the two halves of the
+    // pipeline analyze different programs. Only the cache-miss path re-parses;
+    // with a cached tree the emitter ignores the text. The transform is
+    // length-preserving, so every offset still indexes the original.
+    const parseText =
+      cachedTree === undefined
+        ? (provider.preprocessSource?.(sourceText, filePath) ?? sourceText)
+        : sourceText;
+    const captures = provider.emitScopeCaptures(parseText, filePath, cachedTree, {
+      sourceKind,
+      ...(scriptLanguage !== undefined ? { scriptLanguage } : {}),
+      ...(notebookSegments ? { notebookSegments } : {}),
+      ...(lineOffset !== undefined ? { lineOffset } : {}),
+      ...(sourceLineMap !== undefined ? { sourceLineMap } : {}),
+    });
     return extractScope(captures, filePath, provider);
   } catch (err) {
     const message = `scope extraction failed for ${filePath}: ${
       err instanceof Error ? err.message : String(err)
     }`;
-    if (onWarn !== undefined) onWarn(message);
+    if (onWarn !== undefined) {
+      try {
+        onWarn(message);
+      } catch (warnErr) {
+        logger.warn(
+          `scope extraction warning callback failed for ${filePath}: ${
+            warnErr instanceof Error ? warnErr.message : String(warnErr)
+          }`,
+        );
+      }
+    }
     logger.warn(message);
     return undefined;
   }

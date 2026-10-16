@@ -8,6 +8,7 @@ import {
   refreshBaseRefLine,
   markdownSafeBranch,
 } from '../../src/cli/ai-context.js';
+import { _captureLogger } from '../../src/core/logger.js';
 
 describe('generateAIContextFiles', () => {
   let tmpDir: string;
@@ -48,6 +49,22 @@ describe('generateAIContextFiles', () => {
     expect(content).toContain('gitnexus:start');
     expect(content).toContain('gitnexus:end');
     expect(content).toContain('TestProject');
+  });
+
+  it('tells agents to preview with rename dry_run, not a separate rename_preview tool', async () => {
+    await generateAIContextFiles(tmpDir, storagePath, 'TestProject', {
+      nodes: 50,
+      edges: 100,
+      processes: 5,
+    });
+
+    for (const file of ['CLAUDE.md', 'AGENTS.md']) {
+      const content = await fs.readFile(path.join(tmpDir, file), 'utf-8');
+      expect(content).toContain(
+        'use `rename` with `dry_run: true` first, review the graph-backed semantic spans and coverage, then apply with `dry_run: false`',
+      );
+      expect(content).not.toContain('rename_preview');
+    }
   });
 
   it('omits volatile counts when noStats option is set (#1477)', async () => {
@@ -119,10 +136,13 @@ describe('generateAIContextFiles', () => {
       for (const f of ['CLAUDE.md', 'AGENTS.md']) {
         const content = await fs.readFile(path.join(subDir, f), 'utf-8');
         // Primary command is the fixed project-local runner, not machine-resolved.
-        expect(content).toContain('`node .gitnexus/run.cjs analyze`');
+        expect(content).toContain('`node .gitnexus/run.cjs analyze --index-only`');
         expect(content).not.toContain('run `gitnexus analyze`'); // no machine-resolved leak
         // Bootstrap path (for a not-yet-analyzed checkout) + npm-11 escape hatch.
-        expect(content).toContain('npx gitnexus analyze');
+        // Every install-free runner is named, so a machine without npm (bun-only)
+        // still finds a bootstrap command it can actually run.
+        expect(content).toContain('`npx`, `bunx`, or `pnpm dlx`');
+        expect(content).toContain('bunx gitnexus@latest analyze');
         expect(content).toContain('1939');
       }
     } finally {
@@ -149,6 +169,67 @@ describe('generateAIContextFiles', () => {
     expect(content).not.toMatch(/npx gitnexus group/);
   });
 
+  it('pairs mandatory MCP checks with project-local CLI fallbacks (#2671)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-ai-ctx-transport-fallback-'));
+    const storage = path.join(dir, '.gitnexus');
+    await fs.mkdir(storage, { recursive: true });
+    try {
+      await generateAIContextFiles(
+        dir,
+        storage,
+        'TransportFallback',
+        { nodes: 50, edges: 100, processes: 5 },
+        undefined,
+        { defaultBranch: 'develop' },
+      );
+
+      for (const file of ['AGENTS.md', 'CLAUDE.md']) {
+        const content = await fs.readFile(path.join(dir, file), 'utf-8');
+        expect(content).toContain('impact({target: "symbolName", direction: "upstream"})');
+        expect(content).toContain(
+          'node .gitnexus/run.cjs impact "symbolName" --direction upstream --repo .',
+        );
+        expect(content).toContain('detect_changes({scope: "all"})');
+        expect(content).toContain('node .gitnexus/run.cjs detect-changes --scope all --repo .');
+        expect(content).toContain('target branch "develop"');
+        expect(content).toContain('target branch "develop" from its remote');
+        expect(content).toContain('compute its merge base with the reviewed HEAD');
+        expect(content).toContain(
+          'detect_changes({scope: "compare", base_ref: "<merge-base SHA>"})',
+        );
+        expect(content).toContain('--scope compare --base-ref "<merge-base SHA>" --repo .');
+        expect(content).toContain('Never substitute grep for graph analysis');
+        expect(content).not.toContain('gitnexus impact --target');
+      }
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the configured runner for transport fallbacks, including PDG impact (#2671)', () => {
+    const content = generateGitNexusContent(
+      'TransportFallback',
+      { nodes: 50, edges: 100, processes: 5 },
+      {
+        runnerPath: '.custom/gitnexus-runner.cjs',
+        hasPdg: true,
+      },
+    );
+
+    expect(content).toContain(
+      'node .custom/gitnexus-runner.cjs impact "symbolName" --direction upstream --repo .',
+    );
+    expect(content).toContain(
+      'node .custom/gitnexus-runner.cjs detect-changes --scope all --repo .',
+    );
+    expect(content).toContain(
+      'node .custom/gitnexus-runner.cjs impact "symbolName" --direction upstream --mode pdg --line <N> --repo .',
+    );
+    expect(content).toContain('--mode pdg');
+    expect(content).toContain('--line <N>');
+    expect(content).not.toContain('node .gitnexus/run.cjs impact');
+  });
+
   it('gates the pdg_query line on hasPdg (#2086 M6 — no existing taint gate to mirror)', () => {
     const stats = { nodes: 50, edges: 100, processes: 5 };
     // hasPdg=true → the pdg_query line is present.
@@ -166,10 +247,47 @@ describe('generateAIContextFiles', () => {
     expect(withoutPdg).toContain('explain(');
   });
 
+  it('gates Spring Actuator runtime evidence guidance on index metadata', () => {
+    const stats = { nodes: 50, edges: 100, processes: 5 };
+    const enabled = generateGitNexusContent('SpringProject', stats, {
+      hasSpringActuator: true,
+    });
+    const disabled = generateGitNexusContent('PlainProject', stats);
+
+    expect(enabled).toContain('Spring Actuator runtime evidence is enabled');
+    expect(enabled).toContain('runtimeConfirmed === true');
+    expect(enabled).toContain('Snapshot values are never persisted');
+    expect(disabled).not.toContain('Spring Actuator runtime evidence is enabled');
+  });
+
+  it('documents the MCP and Graph-RAG File-risk scale difference', () => {
+    const content = generateGitNexusContent('RiskScaleProject', {
+      nodes: 50,
+      edges: 100,
+      processes: 5,
+    });
+    expect(content).toContain('MCP File omits axes');
+    expect(content).toContain('Graph-RAG expands File');
+  });
+
+  it('emits MD060-compatible compact tables in generated docs (#2709)', () => {
+    const content = generateGitNexusContent('MarkdownProject', {
+      nodes: 50,
+      edges: 100,
+      processes: 5,
+    });
+
+    expect(content).toContain('| Resource | Use for |\n| --- | --- |\n');
+    expect(content).toContain('| Task | Read this skill file |\n| --- | --- |\n');
+    expect(content).not.toContain('|----------|---------|');
+    expect(content).not.toContain('|------|---------------------|');
+  });
+
   it('degrades gracefully when the runner copy fails (#1945)', async () => {
     // A read-only/full-disk storage dir must not abort generation. The copy is
     // best-effort + logged; the generated docs still carry the inline bootstrap
-    // (`npx gitnexus analyze`) so a reader hitting the absent runner has a path.
+    // (`bunx gitnexus@latest analyze`) so a reader hitting the absent runner has
+    // a path.
     const subDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-copyfail-'));
     const subStorage = path.join(subDir, '.gitnexus');
     await fs.mkdir(subStorage, { recursive: true });
@@ -179,7 +297,7 @@ describe('generateAIContextFiles', () => {
       // Must not throw despite the copy failure.
       await generateAIContextFiles(subDir, subStorage, 'CopyFail', stats);
       const content = await fs.readFile(path.join(subDir, 'CLAUDE.md'), 'utf-8');
-      expect(content).toContain('npx gitnexus analyze'); // bootstrap survives
+      expect(content).toContain('bunx gitnexus@latest analyze'); // bootstrap survives
       // The runner was not written, so the file is absent.
       await expect(fs.access(path.join(subStorage, 'run.cjs'))).rejects.toThrow();
     } finally {
@@ -199,7 +317,10 @@ describe('generateAIContextFiles', () => {
 
     const content = await fs.readFile(path.join(tmpDir, 'CLAUDE.md'), 'utf-8');
 
-    expect(content).toContain('Index stale? Run `node .gitnexus/run.cjs analyze`');
+    expect(content).toContain('Index stale? Run `node .gitnexus/run.cjs analyze --index-only`');
+    expect(content).toContain(
+      'On query/context/impact/cypher object results, read staleness.status and branch/lastCommit',
+    );
     expect(content).toContain('## Always Do');
     expect(content).toContain('## Never Do');
     expect(content).toContain('## Resources');
@@ -235,10 +356,24 @@ describe('generateAIContextFiles', () => {
     // legitimate future additions but will fail loudly if the trim is
     // reverted or someone pads the block back out toward the original size.
     //
-    // Raised 2700 → 2900 for #243: the regression-compare example (one
-    // load-bearing per-repo `base_ref` line on the detect_changes bullet) is a
-    // legitimate addition, not a revert of the trim — the block stays roughly
-    // half the original size.
+    // Raised 2700 → 2900 for #243, then 2900 → 2950 for the bunx bootstrap note,
+    // then 0.55 → 0.65 for the #2899 `risk: UNKNOWN` Always-Do bullet + Never-Do
+    // clause (previously hand-added inside the committed docs instead of this
+    // template, so a real `gitnexus analyze` silently deleted them on every
+    // regeneration — moving them into the template is the fix, and they are
+    // unconditional text load-bearing enough to warrant the budget), then
+    // 0.65 → 0.70 for the #3291 always-on `staleness` blockquote line (a second
+    // `>` line, not a new Always-Do bullet — the cheaper durable slot; the
+    // 0.65 band had ~3 chars of headroom so any useful line required a bump) —
+    // each time with the same argument, that the added line is load-bearing and
+    // the block is still meaningfully smaller than the original. That is a
+    // ratchet with no ratchet: an absolute cap can only ever fail on the PR
+    // that adds the character, and the fix is always to nudge the number.
+    // Assert the invariant the justifications actually appeal to — the RATIO
+    // to the pre-trim size — so a legitimate clause fits without ceremony
+    // while a genuine re-pad fails. (The structural guard is the sibling test
+    // asserting the six #856 section headers stay deleted; this one bounds bulk.)
+    const PRE_TRIM_BLOCK_CHARS = 5465;
     const stats = { nodes: 50, edges: 100, processes: 5 };
     await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
 
@@ -247,7 +382,7 @@ describe('generateAIContextFiles', () => {
       content.indexOf('<!-- gitnexus:start -->'),
       content.indexOf('<!-- gitnexus:end -->'),
     );
-    expect(block.length).toBeLessThan(2900);
+    expect(block.length).toBeLessThan(PRE_TRIM_BLOCK_CHARS * 0.7);
   });
 
   it('handles empty stats', async () => {
@@ -283,7 +418,7 @@ Some project docs here.
 <!-- gitnexus:keep -->
 # GitNexus — Code Knowledge Graph
 
-Indexed as **TestProject** (50 symbols, 100 relationships, 5 execution flows). MCP tools.
+Indexed as **OldName** (50 symbols, 100 relationships, 5 execution flows). MCP tools.
 
 | Tool | Use for |
 |------|---------|
@@ -294,7 +429,9 @@ Resources: gitnexus://repo/TestProject/context
 `;
     await fs.writeFile(claudeMdPath, customContent, 'utf-8');
 
-    // Run analyze with new stats — should only update the stats line
+    // Run analyze with new stats — should only update the stats line. The seed
+    // carries a stale project NAME because a counts-only delta is now preserved
+    // rather than written (#2907); the rename is what makes this a real update.
     const stats = { nodes: 999, edges: 1234, processes: 42 };
     await generateAIContextFiles(tmpDir, storagePath, 'TestProject', stats);
 
@@ -388,7 +525,11 @@ Old content here.
       await expect(
         fs.access(path.join(dir, '.claude', 'skills', 'gitnexus-exploring', 'SKILL.md')),
       ).resolves.toBeUndefined();
-      await expect(fs.access(legacyKnown)).rejects.toThrow();
+      // Divergent nested SKILL.md is preserved (#3080); only byte-identical
+      // leftovers are still removed.
+      await expect(fs.readFile(path.join(legacyKnown, 'SKILL.md'), 'utf-8')).resolves.toBe(
+        'legacy',
+      );
       await expect(fs.readFile(path.join(legacyUnknown, 'SKILL.md'), 'utf-8')).resolves.toBe(
         'custom nested',
       );
@@ -426,6 +567,198 @@ Old content here.
       ).rejects.toThrow();
     } finally {
       await fs.rm(skipDir, { recursive: true, force: true });
+    }
+  });
+
+  it('skipSkills does not remove nested leftover standard skills (#3080 / AE4)', async () => {
+    const skipDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-ai-ctx-skip-nested-'));
+    const skipStorage = path.join(skipDir, '.gitnexus');
+    const nested = path.join(skipDir, '.claude', 'skills', 'gitnexus', 'gitnexus-cli');
+    const bundled = await fs.readFile(
+      path.join(__dirname, '../../skills/gitnexus-cli.md'),
+      'utf-8',
+    );
+    await fs.mkdir(nested, { recursive: true });
+    await fs.mkdir(skipStorage, { recursive: true });
+    await fs.writeFile(path.join(nested, 'SKILL.md'), bundled, 'utf-8');
+    try {
+      await generateAIContextFiles(skipDir, skipStorage, 'TestProject', { nodes: 1 }, undefined, {
+        skipAgentsMd: true,
+        skipSkills: true,
+      });
+      await expect(fs.readFile(path.join(nested, 'SKILL.md'), 'utf-8')).resolves.toBe(bundled);
+      await expect(
+        fs.access(path.join(skipDir, '.claude', 'skills', 'gitnexus-cli')),
+      ).rejects.toThrow();
+    } finally {
+      await fs.rm(skipDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves customized flat SKILL.md under skipAgentsMd (#3080 / AE1)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-3080-flat-'));
+    const storage = path.join(dir, '.gitnexus');
+    const cliSkill = path.join(dir, '.claude', 'skills', 'gitnexus-cli', 'SKILL.md');
+    await fs.mkdir(path.dirname(cliSkill), { recursive: true });
+    await fs.mkdir(storage, { recursive: true });
+    await fs.writeFile(cliSkill, 'CUSTOM-COMMITTED-SKILL-3080-cli\n', 'utf-8');
+    const cap = _captureLogger();
+    try {
+      const result = await generateAIContextFiles(
+        dir,
+        storage,
+        'TestProject',
+        { nodes: 1 },
+        undefined,
+        { skipAgentsMd: true },
+      );
+      expect(result.files).toContain('AGENTS.md (skipped via --skip-agents-md)');
+      expect(result.files.some((f) => f.includes('skipped via --skip-skills'))).toBe(false);
+      await expect(fs.readFile(cliSkill, 'utf-8')).resolves.toBe(
+        'CUSTOM-COMMITTED-SKILL-3080-cli\n',
+      );
+      const msgs = cap.records().map((r) => r.msg ?? '');
+      expect(msgs.some((m) => m.includes(cliSkill) && m.includes('--skip-skills'))).toBe(true);
+    } finally {
+      cap.restore();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('creates a missing standard skill from the bundle (#3080 / AE2)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-3080-missing-'));
+    const storage = path.join(dir, '.gitnexus');
+    await fs.mkdir(storage, { recursive: true });
+    try {
+      await generateAIContextFiles(dir, storage, 'TestProject', { nodes: 1 }, undefined, {
+        skipAgentsMd: true,
+      });
+      const created = await fs.readFile(
+        path.join(dir, '.claude', 'skills', 'gitnexus-debugging', 'SKILL.md'),
+        'utf-8',
+      );
+      const bundled = await fs.readFile(
+        path.join(__dirname, '../../skills/gitnexus-debugging.md'),
+        'utf-8',
+      );
+      expect(created).toBe(bundled);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rewrites a SKILL.md that already matches the current bundle (R2)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-3080-ident-'));
+    const storage = path.join(dir, '.gitnexus');
+    const dest = path.join(dir, '.claude', 'skills', 'gitnexus-cli', 'SKILL.md');
+    const bundled = await fs.readFile(
+      path.join(__dirname, '../../skills/gitnexus-cli.md'),
+      'utf-8',
+    );
+    await fs.mkdir(path.dirname(dest), { recursive: true });
+    await fs.mkdir(storage, { recursive: true });
+    await fs.writeFile(dest, bundled, 'utf-8');
+    const writeSpy = vi.spyOn(fs, 'writeFile');
+    try {
+      await generateAIContextFiles(dir, storage, 'TestProject', { nodes: 1 }, undefined, {
+        skipAgentsMd: true,
+      });
+      await expect(fs.readFile(dest, 'utf-8')).resolves.toBe(bundled);
+      expect(writeSpy).toHaveBeenCalledWith(dest, bundled, 'utf-8');
+    } finally {
+      writeSpy.mockRestore();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('removes nested leftover when SKILL.md matches the bundle', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-3080-nested-ident-'));
+    const storage = path.join(dir, '.gitnexus');
+    const nested = path.join(dir, '.claude', 'skills', 'gitnexus', 'gitnexus-cli');
+    const bundled = await fs.readFile(
+      path.join(__dirname, '../../skills/gitnexus-cli.md'),
+      'utf-8',
+    );
+    await fs.mkdir(nested, { recursive: true });
+    await fs.mkdir(storage, { recursive: true });
+    await fs.writeFile(path.join(nested, 'SKILL.md'), bundled, 'utf-8');
+    try {
+      await generateAIContextFiles(dir, storage, 'TestProject', { nodes: 1 }, undefined, {
+        skipAgentsMd: true,
+      });
+      await expect(fs.access(nested)).rejects.toThrow();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves nested leftover siblings even when SKILL.md matches the bundle', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-3080-nested-sibling-'));
+    const storage = path.join(dir, '.gitnexus');
+    const nested = path.join(dir, '.claude', 'skills', 'gitnexus', 'gitnexus-cli');
+    const bundled = await fs.readFile(
+      path.join(__dirname, '../../skills/gitnexus-cli.md'),
+      'utf-8',
+    );
+    await fs.mkdir(nested, { recursive: true });
+    await fs.mkdir(storage, { recursive: true });
+    await fs.writeFile(path.join(nested, 'SKILL.md'), bundled, 'utf-8');
+    await fs.writeFile(path.join(nested, 'notes.md'), 'operator notes\n', 'utf-8');
+    const cap = _captureLogger();
+    try {
+      const result = await generateAIContextFiles(
+        dir,
+        storage,
+        'TestProject',
+        { nodes: 1 },
+        undefined,
+        { skipAgentsMd: true },
+      );
+      await expect(fs.readFile(path.join(nested, 'notes.md'), 'utf-8')).resolves.toBe(
+        'operator notes\n',
+      );
+      expect(result.files).toContain(
+        '.claude/skills/gitnexus/<name>/ (legacy directories preserved: 1)',
+      );
+      expect(cap.records().some((record) => record.msg?.includes('operator-owned files'))).toBe(
+        true,
+      );
+    } finally {
+      cap.restore();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a divergent .agents mirror while writing a missing .claude copy', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-3080-agents-'));
+    const storage = path.join(dir, '.gitnexus');
+    const agentsSkill = path.join(dir, '.agents', 'skills', 'gitnexus-cli', 'SKILL.md');
+    await fs.mkdir(path.dirname(agentsSkill), { recursive: true });
+    await fs.mkdir(storage, { recursive: true });
+    await fs.writeFile(agentsSkill, 'CUSTOM-AGENTS-MIRROR\n', 'utf-8');
+    try {
+      const result = await generateAIContextFiles(
+        dir,
+        storage,
+        'TestProject',
+        { nodes: 1 },
+        undefined,
+        {
+          skipAgentsMd: true,
+        },
+      );
+      await expect(fs.readFile(agentsSkill, 'utf-8')).resolves.toBe('CUSTOM-AGENTS-MIRROR\n');
+      const claudeCopy = await fs.readFile(
+        path.join(dir, '.claude', 'skills', 'gitnexus-cli', 'SKILL.md'),
+        'utf-8',
+      );
+      expect(claudeCopy).not.toBe('CUSTOM-AGENTS-MIRROR\n');
+      expect(claudeCopy.length).toBeGreaterThan(0);
+      expect(result.files).toContain(
+        '.agents/skills/gitnexus-*/ (5 written, 1 preserved for .agents)',
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
     }
   });
 
@@ -883,7 +1216,7 @@ Project-specific agent guidance.
 <!-- gitnexus:keep -->
 # GitNexus context for AGENTS
 
-Indexed as **AgentsTest** (10 symbols, 20 relationships, 1 execution flows).
+Indexed as **AgentsOldName** (10 symbols, 20 relationships, 1 execution flows).
 
 Use 'query' for finding flows, 'context' for symbol details.
 <!-- gitnexus:end -->
@@ -948,7 +1281,7 @@ Indexed as **Idem** (1 symbols, 2 relationships, 3 execution flows). Custom.
         '\r\n' +
         '<!-- gitnexus:start -->\r\n' +
         '<!-- gitnexus:keep -->\r\n' +
-        'Indexed as **CRLFTest** (5 symbols, 6 relationships, 7 execution flows). Custom CRLF.\r\n' +
+        'Indexed as **CRLFOldName** (5 symbols, 6 relationships, 7 execution flows). Custom CRLF.\r\n' +
         '<!-- gitnexus:end -->\r\n';
       await fs.writeFile(claudePath, crlfContent, 'utf-8');
 
@@ -1146,19 +1479,30 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
   });
 
   // ──────────────────────────────────────────────────────────────────
-  // Configurable default branch in the regression example (#243)
+  // Configurable review target and exact merge-base guidance (#243, #3509)
   // ──────────────────────────────────────────────────────────────────
 
-  it('generated regression-compare example uses the configured default branch (#243)', () => {
+  it('uses the configured branch only as a review target, never as base_ref (#243, #3509)', () => {
     const stats = { nodes: 50, edges: 100, processes: 5 };
     const develop = generateGitNexusContent('P', stats, { defaultBranch: 'develop' });
-    expect(develop).toContain('base_ref: "develop"');
-    expect(develop).not.toContain('base_ref: "main"');
+    expect(develop).toContain('target branch "develop" from its remote');
+    expect(develop).toContain('compute its merge base with the reviewed HEAD');
+    expect(develop).not.toContain('GitHub');
+    expect(develop).not.toContain('PR base/head');
+    expect(develop).not.toContain('git fetch origin');
+    expect(develop).toContain('base_ref: "<merge-base SHA>"');
+    expect(develop).not.toContain('base_ref: "develop"');
   });
 
-  it('defaults the regression-compare example to "main" when no branch is configured (#243)', () => {
+  it('defaults the review target to main without comparing to the main tip (#243, #3509)', () => {
     const content = generateGitNexusContent('P', { nodes: 50, edges: 100, processes: 5 });
-    expect(content).toContain('base_ref: "main"');
+    expect(content).toContain('target branch "main" from its remote');
+    expect(content).toContain('compute its merge base with the reviewed HEAD');
+    expect(content).not.toContain('GitHub');
+    expect(content).not.toContain('PR base/head');
+    expect(content).not.toContain('git fetch origin');
+    expect(content).toContain('base_ref: "<merge-base SHA>"');
+    expect(content).not.toContain('base_ref: "main"');
   });
 
   it('references MCP tools by their registered (unprefixed) names (#2059)', () => {
@@ -1168,7 +1512,7 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
     // tool that does not exist.
     expect(content).not.toMatch(/gitnexus_(impact|query|context|detect_changes|rename|cypher)/);
     expect(content).toContain('impact({target: "symbolName", direction: "upstream"})');
-    expect(content).toContain('detect_changes()');
+    expect(content).toContain('detect_changes({scope: "all"})');
     // #2175: the generated guidance must advertise the renamed param, never the
     // legacy "query" key (Claude Code drops a tool arg named exactly "query").
     expect(content).toContain('query({search_query: "concept"})');
@@ -1180,22 +1524,24 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
     // A branch name with a double-quote must be JSON-escaped, not concatenated
     // raw, so it stays inside the inline code span.
     const content = generateGitNexusContent('P', { nodes: 1 }, { defaultBranch: 'we"ird' });
-    expect(content).toContain('base_ref: "we\\"ird"');
+    expect(content).toContain('target branch "we\\"ird"');
+    expect(content).toContain('--base-ref "<merge-base SHA>" --repo .');
   });
 
   it('a backtick branch cannot break the generated Markdown code span (#1996 P1)', () => {
     // The branch is embedded inside a backtick inline-code span; a stray
     // backtick would close it early. markdownSafeBranch strips it at the sink.
     const content = generateGitNexusContent('P', { nodes: 1 }, { defaultBranch: 'main`evil' });
-    const line = content.split('\n').find((l) => l.includes('base_ref'))!;
+    const line = content.split('\n').find((l) => l.includes('target branch'))!;
     // Even backtick count ⇒ every span is balanced (the regression line opens
     // and closes exactly one).
     expect((line.match(/`/g) || []).length % 2).toBe(0);
     expect(line).not.toContain('main`evil');
+    expect(line).toContain('target branch "mainevil" from its remote');
     expect(markdownSafeBranch('a`b`c')).toBe('abc');
   });
 
-  it('refreshBaseRefLine updates base_ref in place, preserving the rest of the block (#1996 P2)', async () => {
+  it('refreshBaseRefLine migrates legacy guidance and preserves the rest of the block (#1996 P2, #3509)', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-baseref-'));
     try {
       // Seed a realistic block: a configured base_ref "main" plus a community
@@ -1205,7 +1551,7 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-- run \`detect_changes({scope: "compare", base_ref: "main"})\`.
+For regression review: \`detect_changes({scope: "compare", base_ref: "main"})\` or \`.gitnexus/run.cjs detect-changes --scope compare --base-ref "main" --repo .\`.
 
 | Task | Read this skill file |
 |------|---------------------|
@@ -1221,7 +1567,11 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
 
       for (const f of ['AGENTS.md', 'CLAUDE.md']) {
         const after = await fs.readFile(path.join(dir, f), 'utf-8');
-        expect(after).toContain('base_ref: "develop"');
+        expect(after).toContain('target branch "develop"');
+        expect(after).toContain('compute its merge base with the reviewed HEAD');
+        expect(after).toContain('target branch "develop" from its remote');
+        expect(after).toContain('base_ref: "<merge-base SHA>"');
+        expect(after).not.toContain('base_ref: "develop"');
         expect(after).not.toContain('base_ref: "main"');
         // The community-skill row (and everything else) is preserved.
         expect(after).toContain('.claude/skills/gitnexus-area-auth/SKILL.md');
@@ -1235,14 +1585,14 @@ Indexed as **placeholder** (1 symbols, 1 relationships, 1 execution flows). Cust
       const skipped = await refreshBaseRefLine(dir, 'master', { skipAgentsMd: true });
       expect(skipped.files).toEqual([]);
       expect(await fs.readFile(path.join(dir, 'AGENTS.md'), 'utf-8')).toContain(
-        'base_ref: "develop"',
+        'target branch "develop"',
       );
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
 
-  it('refreshBaseRefLine is a no-op when there is no base_ref line or no file (#1996 P2)', async () => {
+  it('refreshBaseRefLine is a no-op when there is no generated review line or no file (#1996 P2)', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-baseref-noop-'));
     try {
       // No AGENTS.md/CLAUDE.md at all → no files updated, no throw.
@@ -1256,6 +1606,150 @@ Indexed as **P**. Custom.
       await fs.writeFile(path.join(dir, 'CLAUDE.md'), seed, 'utf-8');
       expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual([]);
       expect(await fs.readFile(path.join(dir, 'CLAUDE.md'), 'utf-8')).toBe(seed);
+
+      const custom = `<!-- gitnexus:start -->
+Custom target branch "main" and base_ref: "main" notes.
+<!-- gitnexus:end -->
+`;
+      await fs.writeFile(path.join(dir, 'AGENTS.md'), custom, 'utf-8');
+      expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual([]);
+      expect(await fs.readFile(path.join(dir, 'AGENTS.md'), 'utf-8')).toBe(custom);
+
+      // A user-authored compare instruction is not generated migration state,
+      // even though it contains the same tool call and base_ref shape.
+      const compareInstruction = `<!-- gitnexus:start -->
+Before release, run \`detect_changes({scope: "compare", base_ref: "main"})\` and inspect every returned flow.
+<!-- gitnexus:end -->
+`;
+      await fs.writeFile(path.join(dir, 'CLAUDE.md'), compareInstruction, 'utf-8');
+      expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual([]);
+      expect(await fs.readFile(path.join(dir, 'CLAUDE.md'), 'utf-8')).toBe(compareInstruction);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refreshBaseRefLine updates current merge-base guidance idempotently (#3509)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-review-target-'));
+    try {
+      const seed = generateGitNexusContent('P', { nodes: 1 }, { defaultBranch: 'main' });
+      await fs.writeFile(path.join(dir, 'CLAUDE.md'), seed, 'utf-8');
+
+      expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual(['CLAUDE.md']);
+      const after = await fs.readFile(path.join(dir, 'CLAUDE.md'), 'utf-8');
+      expect(after).toContain('target branch "develop"');
+      expect(after).toContain('base_ref: "<merge-base SHA>"');
+      expect(after).not.toContain('base_ref: "develop"');
+      expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual([]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a custom runner path while migrating legacy guidance (#3509)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-review-runner-'));
+    try {
+      const seed = `<!-- gitnexus:start -->
+For regression review: \`detect_changes({scope: "compare", base_ref: "main"})\` or \`.external-index/run.cjs detect-changes --scope compare --base-ref "main" --repo .\`.
+<!-- gitnexus:end -->
+`;
+      await fs.writeFile(path.join(dir, 'CLAUDE.md'), seed, 'utf-8');
+
+      expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual(['CLAUDE.md']);
+      const after = await fs.readFile(path.join(dir, 'CLAUDE.md'), 'utf-8');
+      expect(after).toContain('`.external-index/run.cjs detect-changes');
+      expect(after).not.toContain('`.gitnexus/run.cjs detect-changes');
+      expect(after).toContain('base_ref: "<merge-base SHA>"');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves same-line custom text after legacy guidance (#3509)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-review-suffix-'));
+    try {
+      const seed = `<!-- gitnexus:start -->
+For regression review: \`detect_changes({scope: "compare", base_ref: "main"})\`. Always inspect src/security.ts before release.
+<!-- gitnexus:end -->
+`;
+      await fs.writeFile(path.join(dir, 'AGENTS.md'), seed, 'utf-8');
+
+      expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual(['AGENTS.md']);
+      const after = await fs.readFile(path.join(dir, 'AGENTS.md'), 'utf-8');
+      expect(after).toContain('target branch "develop"');
+      expect(after).toContain('Always inspect src/security.ts before release.');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['PR GitHub `baseRefOid`/`headRefOid`', 'exact PR base/head commits from host metadata'])(
+    'migrates provider-specific guidance (%s) without losing custom text',
+    async (source) => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-review-host-neutral-'));
+      try {
+        const seed =
+          '<!-- gitnexus:start -->\n' +
+          `Regression base: ${source}; target branch "main" via tracking remote. Fetch both; pass merge-base SHA to ` +
+          '`detect_changes({scope: "compare", base_ref: "<merge-base SHA>"})`. Keep this instruction.\n' +
+          '<!-- gitnexus:end -->\n';
+        await fs.writeFile(path.join(dir, 'AGENTS.md'), seed, 'utf-8');
+        expect((await refreshBaseRefLine(dir, 'main')).files).toEqual(['AGENTS.md']);
+        const after = await fs.readFile(path.join(dir, 'AGENTS.md'), 'utf-8');
+        expect(after).toContain('fetch target branch "main" from its remote');
+        expect(after).toContain('compute its merge base with the reviewed HEAD');
+        expect(after).not.toContain(source);
+        expect(after).toContain('Keep this instruction.');
+        expect((await refreshBaseRefLine(dir, 'main')).files).toEqual([]);
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('preserves same-line custom text when refreshing current guidance (#3509)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-review-current-suffix-'));
+    try {
+      const current = generateGitNexusContent('P', { nodes: 1, edges: 1, processes: 0 });
+      const seed = current.replace(
+        /(For regression review,[^\n]*\.)/,
+        '$1 Always inspect src/security.ts before release.',
+      );
+      await fs.writeFile(path.join(dir, 'AGENTS.md'), seed, 'utf-8');
+
+      expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual(['AGENTS.md']);
+      const after = await fs.readFile(path.join(dir, 'AGENTS.md'), 'utf-8');
+      expect(after).toContain('target branch "develop"');
+      expect(after).toContain('compute its merge base with the reviewed HEAD');
+      expect(after).toContain('Always inspect src/security.ts before release.');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps MCP-only legacy guidance MCP-only and migrates the compact shape (#3509)', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-review-mcp-only-'));
+    try {
+      const prose = `<!-- gitnexus:start -->
+For regression review: \`detect_changes({scope: "compare", base_ref: "main"})\`.
+<!-- gitnexus:end -->
+`;
+      await fs.writeFile(path.join(dir, 'AGENTS.md'), prose, 'utf-8');
+      expect((await refreshBaseRefLine(dir, 'develop')).files).toEqual(['AGENTS.md']);
+      const afterProse = await fs.readFile(path.join(dir, 'AGENTS.md'), 'utf-8');
+      expect(afterProse).toContain('target branch "develop"');
+      expect(afterProse).not.toContain('.gitnexus/run.cjs');
+      await fs.rm(path.join(dir, 'AGENTS.md'));
+
+      const compact = `<!-- gitnexus:start -->
+- run detect_changes({scope: "compare", base_ref: "main"})
+<!-- gitnexus:end -->
+`;
+      await fs.writeFile(path.join(dir, 'CLAUDE.md'), compact, 'utf-8');
+      expect((await refreshBaseRefLine(dir, 'release')).files).toEqual(['CLAUDE.md']);
+      const afterCompact = await fs.readFile(path.join(dir, 'CLAUDE.md'), 'utf-8');
+      expect(afterCompact).toContain('target branch "release"');
+      expect(afterCompact).toContain('merge-base SHA');
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
@@ -1272,11 +1766,142 @@ Indexed as **P**. Custom.
       });
       for (const f of ['CLAUDE.md', 'AGENTS.md']) {
         const content = await fs.readFile(path.join(subDir, f), 'utf-8');
-        expect(content).toContain('base_ref: "release/1.0"');
-        expect(content).not.toContain('base_ref: "main"');
+        expect(content).toContain('target branch "release/1.0"');
+        expect(content).toContain('base_ref: "<merge-base SHA>"');
+        expect(content).not.toContain('base_ref: "release/1.0"');
       }
     } finally {
       await fs.rm(subDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// AGENTS.md and CLAUDE.md are the agent guides teams commit, so a rewrite whose
+// only delta is the volatile counts dirties a tracked file on every reindex
+// (#2907). These assert the write is skipped for a count-only delta and still
+// happens for every material one.
+describe('count-only reindex does not churn the committed block (#2907)', () => {
+  let dir: string;
+  let storage: string;
+
+  beforeAll(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-2907-'));
+    storage = path.join(dir, '.gitnexus');
+    await fs.mkdir(storage, { recursive: true });
+  });
+
+  afterAll(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const read = (file: string): Promise<string> => fs.readFile(path.join(dir, file), 'utf-8');
+
+  it('creates the file with a trailing newline so the next analyze has nothing to append', async () => {
+    await generateAIContextFiles(dir, storage, 'P', { nodes: 10, edges: 20, processes: 3 });
+    expect(await read('CLAUDE.md')).toMatch(/<!-- gitnexus:end -->\n$/);
+    expect(await read('AGENTS.md')).toMatch(/<!-- gitnexus:end -->\n$/);
+  });
+
+  it('leaves both files byte-identical when only the counts moved', async () => {
+    const before = { claude: await read('CLAUDE.md'), agents: await read('AGENTS.md') };
+
+    const result = await generateAIContextFiles(dir, storage, 'P', {
+      nodes: 999999,
+      edges: 888888,
+      processes: 777,
+    });
+
+    expect(await read('CLAUDE.md')).toBe(before.claude);
+    expect(await read('AGENTS.md')).toBe(before.agents);
+    expect(result.files).toContain('CLAUDE.md (preserved)');
+    expect(result.files).toContain('AGENTS.md (preserved)');
+    // The counts the block was created with are the ones still on disk.
+    expect(before.claude).toContain('(10 symbols, 20 relationships, 3 execution flows)');
+  });
+
+  it('still rewrites when something other than the counts changed', async () => {
+    const result = await generateAIContextFiles(dir, storage, 'RenamedProject', {
+      nodes: 10,
+      edges: 20,
+      processes: 3,
+    });
+
+    expect(result.files).toContain('CLAUDE.md (updated)');
+    expect(await read('CLAUDE.md')).toContain('**RenamedProject**');
+  });
+
+  it('still applies --no-stats to an already-injected block', async () => {
+    const result = await generateAIContextFiles(
+      dir,
+      storage,
+      'RenamedProject',
+      { nodes: 10, edges: 20, processes: 3 },
+      undefined,
+      { noStats: true },
+    );
+
+    expect(result.files).toContain('CLAUDE.md (updated)');
+    const content = await read('CLAUDE.md');
+    expect(content).toContain('indexed by GitNexus as **RenamedProject**.');
+    expect(content).not.toContain('(10 symbols, 20 relationships, 3 execution flows)');
+  });
+});
+
+describe('--no-stats drops the per-cluster symbol counts too (#2907)', () => {
+  const stats = { nodes: 10, edges: 20, processes: 3 };
+  const skills = [{ label: 'ingestion', name: 'p-ingestion', symbolCount: 120, fileCount: 10 }];
+
+  it('omits the count under --no-stats and keeps it otherwise', () => {
+    const lean = generateGitNexusContent('P', stats, { generatedSkills: skills, noStats: true });
+    const full = generateGitNexusContent('P', stats, { generatedSkills: skills });
+
+    expect(lean).toContain(
+      '| Work in the ingestion area | `.claude/skills/p-ingestion/SKILL.md` |',
+    );
+    expect(lean).not.toContain('(120 symbols)');
+    expect(full).toContain(
+      '| Work in the ingestion area (120 symbols) | `.claude/skills/p-ingestion/SKILL.md` |',
+    );
+  });
+});
+
+describe('keep-marker blocks follow the same count-only rule (#2907)', () => {
+  const seed = (name: string, counts: string): string => `# Guide
+
+<!-- gitnexus:start -->
+<!-- gitnexus:keep -->
+Indexed as **${name}**${counts}. Lean block.
+<!-- gitnexus:end -->
+`;
+
+  it('preserves on a count-only delta and updates on a rename', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-2907-keep-'));
+    const storage = path.join(dir, '.gitnexus');
+    await fs.mkdir(storage, { recursive: true });
+    try {
+      const original = seed('P', ' (10 symbols, 20 relationships, 3 execution flows)');
+      await fs.writeFile(path.join(dir, 'CLAUDE.md'), original, 'utf-8');
+      await fs.writeFile(path.join(dir, 'AGENTS.md'), original, 'utf-8');
+
+      const preserved = await generateAIContextFiles(dir, storage, 'P', {
+        nodes: 55,
+        edges: 66,
+        processes: 7,
+      });
+      expect(preserved.files).toContain('CLAUDE.md (preserved)');
+      expect(await fs.readFile(path.join(dir, 'CLAUDE.md'), 'utf-8')).toBe(original);
+
+      const renamed = await generateAIContextFiles(dir, storage, 'Q', {
+        nodes: 55,
+        edges: 66,
+        processes: 7,
+      });
+      expect(renamed.files).toContain('CLAUDE.md (updated)');
+      expect(await fs.readFile(path.join(dir, 'CLAUDE.md'), 'utf-8')).toContain(
+        'Indexed as **Q** (55 symbols, 66 relationships, 7 execution flows). Lean block.',
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
     }
   });
 });
