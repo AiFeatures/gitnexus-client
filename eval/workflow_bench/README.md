@@ -1,4 +1,4 @@
-# Workflow benchmark — observe the token savings
+# Skill benchmark — evolve review quality, measure workflow cost
 
 Measures whether the `gitnexus-plan` → `gitnexus-work` engineering workflow
 actually saves tokens versus a baseline agent on the same tasks, using real
@@ -8,18 +8,19 @@ report.
 
 ## What it compares
 
-| Arm | Sessions | Notes |
-| --- | --- | --- |
-| `workflow` | `gitnexus-plan` on the task, then `gitnexus-work` on the produced plan | The skills must be installed (`gitnexus setup`, or repo-local `.claude/skills/`) |
-| `candidate_workflow` | same sessions as `workflow`, with a candidate skill overlay | Paired with `workflow` on the same task/ref/model |
-| `workflow_direct` | one `gitnexus-work` direct-mode session | The middle option — execution discipline without a planning pass |
-| `candidate_workflow_direct` | same session as `workflow_direct`, with a candidate skill overlay | Paired with `workflow_direct` on the same task/ref/model |
-| `ce_workflow` | `ce-plan` on the task, then `ce-work` on the produced plan | External comparator: the explicitly supplied, pinned compound-engineering plugin's plan→work family |
-| `ce_workflow_direct` | one `ce-work` direct-mode session | External comparator paired with `workflow_direct` |
-| `review` | one `gitnexus-review` session over local uncommitted changes | The task's `setup` applies the diff under review; the review is written to `review-output.md` so `verify` can gate on it |
-| `ce_review` | one `ce-code-review` session over the same changes | External comparator paired with `review` |
-| `baseline` | one session with the identical task text | `--disallowedTools Skill` so it cannot borrow the workflow; same repo, same MCP tools |
-| `baseline_nomcp` | like baseline, graph tools also disallowed | Separates the workflow-discipline question from the GitNexus-tools question (off by default) |
+| Arm                         | Sessions                                                                | Notes                                                                                               |
+| --------------------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `workflow`                  | `gitnexus-plan` on the task, then `gitnexus-work` on the produced plan  | The skills must be installed (`gitnexus setup`, or repo-local `.claude/skills/`)                    |
+| `candidate_workflow`        | same sessions as `workflow`, with a candidate skill overlay             | Paired with `workflow` on the same task/ref/model                                                   |
+| `workflow_direct`           | one `gitnexus-work` direct-mode session                                 | The middle option — execution discipline without a planning pass                                    |
+| `candidate_workflow_direct` | same session as `workflow_direct`, with a candidate skill overlay       | Paired with `workflow_direct` on the same task/ref/model                                            |
+| `ce_workflow`               | `ce-plan` on the task, then `ce-work` on the produced plan              | External comparator: the explicitly supplied, pinned compound-engineering plugin's plan→work family |
+| `ce_workflow_direct`        | one `ce-work` direct-mode session                                       | External comparator paired with `workflow_direct`                                                   |
+| `review`                    | one `gitnexus-review` session over an immutable historical PR snapshot  | Emits strict `review-output.json`; hidden human labels score quality after the session              |
+| `candidate_review`          | the same review with a `gitnexus-review` candidate overlay              | Paired with `review` on the same case/ref/model/runtime                                             |
+| `ce_review`                 | one pinned `ce-code-review` session over the same changes               | External comparator paired with both review arms                                                    |
+| `baseline`                  | one session with the identical task text                                | `--disallowedTools Skill` so it cannot borrow the workflow; same repo, same MCP tools               |
+| `baseline_nomcp`            | one session without installed GitNexus tools, graph, or workflow skills | Separates the workflow-discipline question from the GitNexus-tools question (off by default)        |
 
 Every arm runs in a fresh detached git worktree of the task's `ref`, once per
 `--runs`. The model-visible `verify` command is recorded as
@@ -36,7 +37,7 @@ lfg's gate and work's direct-mode triage should encode.
 
 ```bash
 cd eval
-export GITNEXUS_BENCH_AUTH_TOKEN="$ANTHROPIC_API_KEY"
+export GITNEXUS_BENCH_ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
 uv run --locked --extra dev python -m workflow_bench.runner \
   --tasks workflow_bench/tasks.scenarios.yaml --runs 3 \
   --model claude-sonnet-4-20250514
@@ -68,6 +69,125 @@ Output: `results/wfbench-<timestamp>/results.jsonl` (every run, with session
 ids for transcript drill-down) and `report.md` (medians per task per arm,
 plus a savings row: input / cache / output tokens, cost, wall time).
 
+## Release evaluation
+
+### RC regression decision
+
+`workflow_bench.release_gate` compares a candidate report with a freshly
+measured stable-runtime report. Both reports must use the same trusted harness,
+task/oracle pins, model, reasoning effort and repetition count. Each task must
+solve at least as many repetitions with the candidate as with stable; gains on
+one task cannot offset losses on another. Invalid, stale or incomplete evidence
+fails closed. Cost, duration and both no-GitNexus comparisons remain descriptive
+measurements, not additional pass criteria or claims of statistical significance.
+
+```bash
+uv run --locked --extra dev python -m workflow_bench.release_gate \
+  --candidate candidate/agent-evaluation.json --candidate-sha <full-rc-sha> \
+  --stable stable/agent-evaluation.json --stable-sha <full-stable-sha> \
+  --out public
+```
+
+The command writes `release-quality-gate.json` and `release-quality-gate.md`
+and exits nonzero on rejection. Its caller must authenticate the reports and
+resolve the published stable and exact candidate revisions independently;
+self-reported metadata does not establish provenance. Release evaluation
+resolves the latest published stable release and the requested candidate
+itself, then measures both with main's trusted harness. The comparison is a
+regression signal for published RCs; it does not block RC publication.
+
+### Current workflow
+
+Following [discussion #3493](https://github.com/abhigyanpatwari/GitNexus/discussions/3493#discussioncomment-18772530),
+release evidence is split by cost:
+
+1. Every CI run, RC and stable release runs the offline
+   [tool-accuracy corpus](../../gitnexus/bench/tool-accuracy/README.md) against
+   the real ingestion pipeline and tools. Its fixed answers cover #3486–3491
+   and #3497–3499. `accuracy.json` and `accuracy.md` report every failing answer,
+   precision/recall and source/fixture revisions. The initial reviewed gaps
+   remain failures in the accuracy total. The gate rejects new/worsened failures,
+   missing outputs and repaired allowances that have not been removed.
+2. **Release evaluation**, before each stable release and weekly against the
+   latest RC, runs three fresh paired repetitions of every scenario
+   on both candidate and stable runtimes, including the expensive task, using
+   `baseline_nomcp` and MCP `baseline`.
+   Every task starts at the immutable v1.6.12 commit; all four tasks remain
+   unsolved there. The hidden graders have tested negative/positive controls,
+   including retry implementations in either the pipeline or worker pool.
+
+Run **Release evaluation** from `main` before cutting a stable tag. Set
+`candidate_ref` to the full, already-reviewed stable commit SHA. The workflow
+uses main's trusted harness and `--gitnexus-root` to select a separate immutable
+runtime checkout.
+Candidate installs run in Bubblewrap with only that checkout (minus `.git`)
+writable, system tools read-only, and a cleared environment. Locked downloads
+run without package scripts; every lifecycle script then runs with no network. The trusted harness
+and host command files are not mounted into the candidate build.
+Before any paid sessions, `workflow_bench.release_preflight` builds and
+materializes the real sanitized graphs for both runtimes on the runner's temp
+filesystem. A copy or containment failure stops the workflow at that point.
+Buffered copies use the same 2 GiB hard ceiling as snapshot capture, including
+on filesystems without reflinks. This preflight adds an offline graph build per
+runtime; the measured runner rebuilds its own graphs to retain its existing
+provenance and cache lifecycle. Preflight output is not release evidence.
+The report records runtime/harness SHAs, task and oracle digests, model/effort,
+every repetition, solve counts, cost and agent wall time. Failed
+solutions stay in the denominator. Infrastructure/session failures, missing
+costs, incomplete pairs or failed containment make evidence incomplete.
+
+Stable publishing requires a successful default-branch evaluation for that
+**exact commit, measured by main's current evaluator**, no more than seven days
+old. The publish job loads `eval/` from main's head rather than the release
+commit, so later task changes on main do not strand an already-measured
+release. A report counts only when its `harness_sha` is the commit its
+scheduled or manually dispatched `main` run executed, and GitHub's comparison
+from that commit to main's head changes nothing under `eval/`,
+`.github/workflows/release-evaluation.yml` or `.github/claude-canary-runtime/`.
+An unavailable or truncated (300-file) comparison rejects the run. Any change
+to the harness, graders, task pins or agent CLI therefore requires a fresh
+Release evaluation. Runs are tried newest first; a rejected run does not hide an
+older valid one, and when none passes the error lists each rejection.
+It validates task pins, individual cells and recomputed totals before publishing to npm
+or either Docker registry. Docker publication also runs the cheap accuracy
+gate once before both image builds, then builds the verified immutable commit.
+Every release attaches the cheap accuracy evidence; stable releases also attach
+and include their paired agent report. RCs publish after CI without waiting for
+a paid run. The weekly comparison checks that the latest RC preserves each
+covered task's MCP solve count relative to stable. The comparison does not require GitNexus to beat the no-MCP arm or claim that
+four tasks establish general improvements.
+
+The Wednesday release comparison reuses the existing schedule controls:
+`GITNEXUS_EVOLUTION_ENABLED=true` and `GITNEXUS_EVOLUTION_WORKERS=3` enable
+both weekly workflows; disabling evolution also disables scheduled release
+comparisons. No additional opt-in variable or model credential is required.
+Manual release evaluation remains available independently. Scheduled runs
+resolve the newest published RC to its
+commit before execution. The protected `gitnexus-evolution` environment remains
+restricted to main and supplies the existing model secrets. Evaluation runs on
+the dedicated self-hosted EC2 runner. The paid step has a 19-hour cap inside a
+21-hour job and also stops 90 minutes before the configured external shutdown,
+leaving time to upload summaries when a benchmark step fails. Raw transcripts, internal instructions, local
+paths and session files are never uploaded or attached to releases.
+
+The no-GitNexus arm receives no indexed graph, registry, runtime mounts or CLI
+wrapper, and inherited graph-first directives are removed while ordinary
+repository development and test guidance is preserved. Both arms load that
+guidance through the same startup mode. Skills/commands and GitNexus MCP tools
+are disabled in the no-tool arm, and repository/plugin hooks are disabled in
+both arms. It fails closed when Bubblewrap is unavailable. It retains the repository source and
+ordinary test dependencies required by the tasks; rebuilding tools from that
+source is not prevented. The comparison therefore measures access to the
+provided GitNexus tools and their readable compiled runtime on these GitNexus
+development tasks. That runtime can contain later fixes absent from a task's
+historical base, so the comparison cannot isolate tool assistance from access
+to those implementations.
+
+This corpus uses a **fresh index at each task base**. A nightly stale Hermes
+index is a separate condition and must not be pooled with it. Import the
+reporter's sanitized task bundle and Hermes fresh/stale fixtures when available;
+private repositories and raw transcripts are outside the current corpus.
+
 ## Trust model — fail-closed Linux containment
 
 Task files and candidate prose remain untrusted executable inputs. Every
@@ -76,10 +196,21 @@ preflighted Bubblewrap boundary with a private home/config/temp, a
 self-contained clone, a PID namespace, bounded process-tree ownership, and a
 deny-by-default environment. Task-declared dependency roots are mounted
 read-only, while graph assets are rebuilt by the harness as described below.
-Claude runs in bare,
-`dontAsk` mode with strict clone-local MCP configuration; Bash children do
+Claude uses `dontAsk` mode with strict clone-local MCP configuration and
+repository/plugin hooks disabled. Both implementation baselines load ordinary
+repository instructions; the no-tool arm disables skills and uses an empty
+MCP configuration. Bash children do
 not inherit the model credential and their network sandbox denies all
 domains.
+
+The candidate MCP server runs in a separate nested Bubblewrap boundary. Its
+workspace (including the graph), registry, compiled runtime and shared package
+mounts are read-only. Its home and temporary directories are private tmpfs,
+and it has a fresh PID namespace and `/proc`, no network or capabilities, and
+no model credentials or agent state. MCP startup and tool handlers therefore
+cannot write patches that would be credited to the agent; the agent retains
+its writable workspace for implementation tasks. Mutating MCP tools are not
+granted in any phase.
 
 Prebuilt task `.gitnexus` assets are rejected. For each task commit, the
 harness creates the deterministic parentless snapshot first, removes every
@@ -119,11 +250,16 @@ redacts the event objects, and stores the canonical redacted JSONL with a
 digest. Files written beneath the agent's `$HOME` are never trusted as
 evidence.
 
-Bare mode is deliberately non-interactive: it does not consult a stored
-Claude login/keychain or `ANTHROPIC_AUTH_TOKEN`. Supply one explicit API or
-proxy key through `GITNEXUS_BENCH_AUTH_TOKEN` (preferred) or `--auth-token`;
+Sessions use a private home without stored Claude login/keychain state, and
+do not inherit `ANTHROPIC_AUTH_TOKEN`. Supply an Anthropic API key
+through `GITNEXUS_BENCH_ANTHROPIC_API_KEY` (preferred) or `--anthropic-api-key`;
 the harness maps it to `ANTHROPIC_API_KEY` only for the trusted Claude parent
-and scrubs it from agent-launched tools.
+and scrubs it from agent-launched tools. `GITNEXUS_BENCH_AUTH_TOKEN` and
+`--auth-token` remain as aliases. OpenAI keys are not a drop-in
+replacement: pass `--openai-api-key` / `GITNEXUS_BENCH_OPENAI_API_KEY` with
+`gpt-*` / `o*` / `openai/*` model ids and the harness starts a loopback
+LiteLLM proxy. The OpenAI key stays on that host process; Claude still sees
+only a minted `ANTHROPIC_API_KEY` plus `ANTHROPIC_BASE_URL`.
 
 The trusted Claude CLI still needs outbound access to the explicitly supplied
 model endpoint. This is not a network broker, so the CLI itself retains that
@@ -133,12 +269,124 @@ Native benchmark execution is therefore Linux/WSL2-only. Evidence assembly
 and hand-authored overlay preparation can happen elsewhere, but
 `--initial-overlay` does not bypass containment.
 
+For a local diagnostic inside a container that blocks user namespaces, an
+operator may explicitly choose the non-containment host backend:
+
+```bash
+UNSAFE_NO_BWRAP=1 RUNS=1 ./workflow_bench/run-evolution.sh
+```
+
+This mode runs review sessions directly in disposable host worktrees and is
+**not** a security boundary: it does not isolate the network or create a PID
+namespace, and a session that can `chmod` can undo the workspace lock. The
+harness drops write bits on the whole clone, with no carve-out, so accidental
+`npm install` / analyze writes cannot invalidate review evidence. The review
+artifact is not in the clone at all: it lives in a writable directory bound at
+`/review-output`, outside the workspace.
+Sandbox cleanup restores owner write bits before deleting the private TMPDIR,
+because a session that `copytree`s the locked clone would otherwise leave
+non-empty 0555 directories that `rmtree` cannot remove. Historical review
+SHAs that gitignore `.claude/skills/*` are force-added when the harness seeds
+or overlays the evaluated `gitnexus-review` skill.
+Treat model and verifier processes as able to access host files and
+credentials available to the invoking user. It is restricted to the review
+benchmark, forbidden with `--apply` and whenever `CI` is set;
+promotion-capable and CI runs must use Bubblewrap.
+
 ## Prompt and skill evolution loop
 
 Prompts age as models and tool harnesses change. Treat the current skills and
 router thresholds as an incumbent policy, not permanent truth. Candidate
 changes run offline in the same throwaway clones as the incumbent; production
 skills never rewrite themselves from a live task.
+
+On the self-hosted evolution box, `run-evolution.sh` passes
+`--max-runtime-from-instance-window` and the CLI derives its own cap from
+`/proc/uptime` at startup (24h EventBridge window minus a 90-minute upload
+reserve), in the same breath as it starts the clock that cap is measured
+against — a budget computed anywhere earlier is spent by the seconds between. A `workflow_dispatch` that lands on an
+already-running instance therefore exits in-process instead of vanishing when
+the box stops — a cancelled GitHub job skips even `if: always()`, which is
+how run 33962002890 lost 51 finished sessions. Local runs are uncapped.
+
+Both skill evolution and release evaluation manage the existing dedicated EC2
+runner through hosted startup and cleanup jobs. They share a concurrency group
+for the whole run, so neither can stop the instance during the other's work.
+GitHub keeps only one pending run per group, even with `cancel-in-progress:
+false`: a newer queued run of either workflow cancels the older pending one.
+A release evaluation dispatched for a stable publish can therefore be dropped
+while it waits behind a running evolution. Do not queue another run behind a
+pending release evaluation, and confirm its **Start the dedicated EC2 runner**
+job ran before relying on its evidence. If the run shows Cancelled, dispatch it
+again once the group is free.
+Startup waits for EC2 running and both health checks, then a native pickup probe
+must finish within five minutes. If the probe fails, the hosted check cancels
+its own run to clear the queued job. A second hosted watchdog bounds pickup of
+the paid job. Only these watchdogs have Actions write permission.
+
+The protected `gitnexus-evolution` environment holds these four settings
+(configured and verified by the live probes below):
+
+| Setting | Kind | Purpose |
+| --- | --- | --- |
+| `GITNEXUS_EVOLUTION_AWS_ROLE_ARN` | Secret | AWS role assumed through GitHub OIDC |
+| `GITNEXUS_EVOLUTION_EC2_INSTANCE_ID` | Secret | Dedicated runner instance |
+| `GITNEXUS_EVOLUTION_AWS_REGION` | Variable | Instance region |
+| `GITNEXUS_EVOLUTION_STOP_SCHEDULE_UTC` | Variable | Actual weekly EventBridge stop, `DAY HH:MM` UTC |
+
+No long-lived AWS credential is stored. The AWS action obtains short-lived
+credentials using GitHub OIDC. The role trusts only this repository's
+`gitnexus-evolution` environment and permits EC2 DescribeInstances and
+DescribeInstanceStatus, with StartInstances and StopInstances scoped to the
+dedicated instance. Missing configuration or access fails closed.
+The workflow does not create IAM roles, instances, secrets or schedules.
+
+A main-branch dispatch of either workflow with `runner_only=true` starts the
+instance, proves native runner pickup, then stops it without paid model calls.
+Cleanup runs on a hosted runner after success or failure and verifies EC2 is
+actually `stopped`; an accepted StopInstances response alone does not pass.
+Startup failures also attempt immediate cleanup. Keep the existing EventBridge
+stop watchdog enabled because interrupted or force-cancelled GitHub cleanup
+cannot guarantee shutdown. Paid work respects the earlier of the configured
+weekly stop and a 24-hour cap, with a 90-minute evidence reserve.
+
+Choose **Re-run all jobs** after a failed run to repeat startup and pickup.
+Partial retries cannot reuse a previous attempt's startup: the affected probe
+or paid job runs on a hosted runner and fails promptly with that instruction,
+instead of waiting on the stopped instance.
+
+PR tests use a fake AWS CLI to cover transitions, denial, lost responses,
+timeouts, cleanup and workflow wiring. On 2026-10-09, `runner_only=true`
+dispatches of both workflows started the instance, ran the native pickup probe
+on the dedicated runner and verified the instance stopped (runs 37893007912 and
+37895899767, from temporary branches with a runner-only guard exception).
+
+CI separately runs a six-cell paired evaluator canary using the real pinned
+Claude CLI, Bubblewrap, built MCP runtime, hidden grading and public report
+commands. Only its small corpus and local model replies are scripted. One
+failed repair must stay in the report. This proves execution and accounting;
+the canary is not paid-model performance evidence for a stable release.
+
+A review generation is 6 tasks × 3 arms × 3 runs. Serial workers=1 at ~19
+minutes per session is a 16-hour job (run 33962002890). Two harness changes
+cut that without shrinking the gate:
+
+- **Comparator reuse.** `evolve.py` forwards the seed / prior generation as
+  `--reuse-results`. Incumbent `review` and `ce_review` rows are copied into
+  the new `results.jsonl` when model, effort, task SHA, prompt digest, oracle
+  bytes, incumbent skill digest, CE plugin digest, and sandbox backend still
+  match. Candidate arms always run. A weekly generation with an unchanged
+  incumbent therefore pays 18 sessions, not 54. A promotion, model change,
+  task-corpus change, or harness `RUNTIME_DIGEST` change invalidates the
+  lock and re-runs the comparators.
+- **Sanitized clone templates.** Each unique task SHA is cloned and
+  sanitized once. Cells copy that parentless snapshot (reflink when the
+  filesystem allows) instead of `git clone --no-local` plus repack/prune/fsck
+  54 times. Isolation is a private `.git`, not a second copy of full history.
+
+Dispatch defaults to `--workers 3` so those 18 paid cells can overlap. Size
+workers to the host: a cell that loses CPU and hits the session ceiling is
+an excluded run the gate refuses.
 
 Build an overlay that mirrors only the canonical repo-local skill paths:
 
@@ -161,7 +409,7 @@ paid work. For a work overlay:
 cd eval
 uv run --locked --extra dev python -m workflow_bench.runner \
   --tasks workflow_bench/tasks.scenarios.yaml \
-  --runs 3 --model claude-sonnet-4-20250514 \
+  --runs 3 --workers 1 --model claude-sonnet-4-20250514 \
   --arms workflow candidate_workflow \
          workflow_direct candidate_workflow_direct \
   --candidate-overlay /tmp/gn-skill-candidate
@@ -177,7 +425,7 @@ artifacts. Those artifacts are the trajectory evidence: cluster failures and
 expensive detours, propose one bounded prompt change, and feed it back as the
 next overlay.
 
-When candidate arms are present the runner also writes schema-3
+When candidate arms are present the runner also writes schema-6
 `promotion.json`. It
 binds the immutable overlay digest, benchmark model, truthful candidate origin
 (a named proposer model or `manual-initial-overlay`), selected
@@ -186,9 +434,36 @@ immutable dependency bytes, committed base digest of every apply
 destination, exact required arms, thresholds, and evidence expiry. Its default
 deterministic gate is deliberately conservative:
 
+Schema 6 binds a separate policy to each required candidate arm and records
+whether the sweep completed. Apply validates the paired metrics and recomputes
+each decision. Historical schema 5 reports remain readable; regenerate their
+benchmark evidence before applying an overlay. Editing a schema number does
+not supply the missing evidence.
+
+Review candidates optimize weighted F1 with a minimum improvement of 0.01,
+complete paired evidence on every selected task, and no per-task quality
+regression. Complete misses score zero. Matching uses maximum cardinality
+throughout the 100-finding limit. Downgraded findings receive at most their
+reported severity's weight; only blocking-severity matches count toward blocker
+recall. Every valid candidate repeat must have the correct verdict, and the
+minimum blocker recall across repeats must not regress. Clean controls retain
+their false-positive and verdict safeguards. Implementation candidates retain
+the efficiency policy below:
+
 - at least 3 paired VALID runs per task, zero excluded runs in either arm
   (session/infra-error rows therefore block promotion), and a named model;
-- the candidate must pass the hidden oracle on every valid run for every task;
+- a fully measured task that neither arm ever resolves remains reported but is
+  ungated from the quality comparison — only if its metric was measured in both
+  arms and no run hit `skill-not-invoked` (a skill that never loaded is prompt
+  evidence, not task health). An ungated task still ranks against a looser 100%
+  failed-task regression cap on the promotion metric;
+- at least half the paired tasks must stay gated, and `promotion.json` discloses
+  the gated/ungated split per decision; a set with no gated task at all is
+  `insufficient_evidence`;
+- the candidate must pass the hidden oracle on every valid run of every gated
+  task the incumbent resolves at least once — on a task the incumbent never
+  resolves, partial candidate progress counts as improvement instead of failing
+  the floor, so making some progress is never scored worse than making none;
 - no per-task resolution-rate regression (quality is lexicographically first);
 - promotion by resolution needs a margin of at least 2 resolved runs —
   a 1-run difference is noise at this run count and falls through to the
@@ -219,28 +494,85 @@ without weakening today's deterministic promotion boundary.
 
 ### Closing the loop automatically (`evolve.py`)
 
+The evolution workflow runs an offline containment preflight with the pinned
+Claude Code 2.1.214 binary before starting a paid proposer or benchmark. The
+review canary seals the workspace read-only and writes nothing into it: the
+artifact directory is bound at `/review-output` outside the workspace, and the
+file itself is deliberately absent until the session creates it, so its absence
+distinguishes "never written" from "written badly". Runtime mount placeholders
+are prepared in the disposable clone before sealing it; existing config bytes
+are preserved.
+Any pre-existing result entry, including a symlink, is rejected. Required
+canaries fail when their runtime or Bubblewrap is unavailable.
+
+The default outage limit is five consecutive unusable results, across task
+boundaries. Invalid review JSON advances this limit even when a skill or session
+error was recorded first. A valid zero-quality review resets it. Concurrent
+waves can exceed the limit by at most `workers - 1` completed cells; no further
+wave starts after a trip. Completed rows and redacted diagnostics remain in the
+partial report, the runner exits nonzero, and the evolution driver stops without
+applying or starting another generation.
+
+SIGINT and SIGTERM propagate one cancellation event through managed commands,
+including clone, setup, Claude, and verification. Executor submissions copy
+the run context so indirect subprocess helpers receive the same event. Active
+process groups or Windows Job Objects are terminated and workers joined before
+shared assets or the gateway are released. Controlled cancellation tests require
+cleanup within 15 seconds. Cancellation remains distinct from timeout and
+quality failure in recorded evidence.
+
+The gateway runs under a private supervisor watching a pipe owned only by the
+harness. Parent exit, including SIGKILL, closes that pipe and stops the proxy
+group; Windows also retains kill-on-close Job Object ownership. Keep completed
+JSONL rows, transcripts, the partial report, and gateway diagnostics when
+investigating an interrupted run. A subsequent paid comparison needs fresh
+evidence from all arms under the same dependency lock. LiteLLM pricing comes
+from that locked release's local cost map; compare no old/new-lock costs as
+quality evidence.
+
 `workflow_bench.evolve` automates the three manual arrows — propose,
 benchmark, apply — without moving the trust boundary:
 
 ```bash
 cd eval
-uv run --locked --extra dev python -m workflow_bench.evolve \
-  --tasks workflow_bench/tasks.scenarios.yaml \
-  --model claude-sonnet-4-20250514 --generations 2 \
-  --seed-results results/wfbench-<prior-run>   # optional gen-0 evidence
+./workflow_bench/run-evolution.sh                  # local; no working-tree apply
+./workflow_bench/run-evolution.sh --apply          # CI; same argv the workflow uses
+./workflow_bench/run-evolution.sh --dry-run        # print the evolve command
 ```
 
-Each generation: a confined **proposer** session reads the incumbent plan/work
-skills, the prior generation's `results.jsonl`
-loser rows, their session transcripts and patches, and the learning queue,
+The GitHub skill-evolution job calls this script. Do not invoke
+`python -m workflow_bench.evolve` directly for a full loop. Environment knobs
+match the workflow: `MODEL`, `PROPOSER_MODEL`, `GENERATIONS`, `RUNS`,
+`WORKERS`, `PROVIDER`, `EFFORT`, `SEED_RESULTS`, `INCLUDE_EXPENSIVE`. The
+checked-in production defaults are `PROVIDER=openai`, `MODEL=gpt-5.6-sol`,
+`PROPOSER_MODEL=gpt-5.6-sol`, and `EFFORT=xhigh`.
+
+The scheduled/default profile is read-only review evolution. Set
+`EVOLUTION_PROFILE=implementation` explicitly to run the legacy plan/work
+benchmark. Review mode requires `CE_PLUGIN_DIR` and `CE_PLUGIN_VERSION`.
+
+Each review generation: a confined **proposer** session reads only the incumbent
+`gitnexus-review` skill, normalized CE/incumbent/candidate result rows, bounded
+review artifacts and session transcripts, and the rejected
+`proposal.md` when available (including a workflow seed from a prior run), and
+the learning queue,
 then writes ONE bounded candidate overlay plus a reviewer-facing
-`proposal.md`. The overlay is re-validated by `candidate_overlay_files`
-(same boundary: Markdown under the plan/work trees, nothing else), frozen,
+`proposal.md`. The proposer's clone is sanitized exactly like an arm's before
+its session starts: it authors the artifact the arms are scored with, so
+letting it read `eval/workflow_bench` would hand it the task prompts and the
+hidden oracles it is about to be graded against, and a proposal could win the
+gate by encoding the expected behavior into a skill rather than by being a
+better skill. The overlay is re-validated by `candidate_overlay_files`
+(same boundary: Markdown under `gitnexus-review`, including exercised
+`ci-personas/`, nothing else), frozen,
 and exercised only by its exact required pairs. Task refs are resolved once
 before generation zero and the immutable task bindings are forwarded to every
 generated runner invocation, so a moving branch cannot change later evidence.
-The deterministic gate then decides. Promotion application rejects older
-pre-oracle evidence schemas. `promote` stops the loop; with `--apply`
+The deterministic quality-first gate rejects blocker-recall regressions,
+new false positives on clean controls, and any weighted-score regression.
+Repeated evidence (`RUNS>=3`) is required for promotion; `RUNS=1` is
+diagnostic-only. CE is the external comparator. Cost and latency are
+tiebreakers and never compensate for quality loss. `promote` stops the loop; with `--apply`
 the authorized frozen bytes
 are transactionally applied to the canonical
 `.claude/skills/` trees and their shipped mirrors as an ordinary
@@ -250,17 +582,19 @@ generation's trajectories to the next proposer. `--initial-overlay` skips
 the generation-0 proposer to benchmark a hand-written candidate;
 `--proposer-model` upgrades only the diagnosis session.
 
-**Learning queue.** Live plan/work skill runs never self-edit (see each
+**Learning queue.** Live skill runs never self-edit (see each
 skill's "Skill feedback" section) — instead they may append one-line JSON notes to
 `workflow_bench/learnings.jsonl` (gitignored, machine-local like the
 transcripts they complement). The proposer reads the queue as hints, not
 ground truth: a learning only reaches a shipped skill by surviving the same
-paired benchmark as any other candidate. Legacy review/LFG rows are ignored;
-those skills do not yet have honest candidate lanes or promotion gates.
+paired benchmark as any other candidate.
 
-Run the driver on the existing re-evaluation triggers (model/harness change,
-90-day staleness), not on a tight schedule — every generation costs ≥3 paired
-runs per task, and `--generations` is the only loop bound.
+For ad-hoc use, run the driver on the existing re-evaluation triggers
+(model/harness change or 90-day staleness). The repository workflow runs a
+deliberate weekly drift check: dispatch defaults to three concurrent cells
+of one task; scheduled concurrency still requires
+`GITNEXUS_EVOLUTION_WORKERS=3` after a clean proof. `--workers` is bounded
+to 1–8 before paid work starts. `--generations` remains the only loop bound.
 
 ## Free-model setup (no paid tokens)
 
@@ -279,12 +613,30 @@ uv run --locked --with 'litellm[proxy]' litellm --config workflow_bench/free-mod
 # 2. Point the benchmark at it
 uv run --locked --extra dev python -m workflow_bench.runner \
   --tasks workflow_bench/tasks.scenarios.yaml --runs 3 \
-  --base-url http://localhost:4000 --auth-token "$LITELLM_MASTER_KEY" --model free-coder
+  --base-url http://localhost:4000 --anthropic-api-key "$LITELLM_MASTER_KEY" --model free-coder
 ```
+
+## OpenAI API keys
+
+Claude Code still speaks Anthropic `/v1/messages`. For a paid OpenAI backend,
+do not point `--anthropic-api-key` at an `sk-...` OpenAI key. Export the OpenAI key
+and use OpenAI model ids; the driver starts the proxy itself:
+
+```bash
+export GITNEXUS_BENCH_OPENAI_API_KEY="$OPENAI_API_KEY"
+PROVIDER=openai ./workflow_bench/run-evolution.sh
+```
+
+The GitHub skill-evolution workflow accepts `GITNEXUS_BENCH_OPENAI_API_KEY` on
+the `gitnexus-evolution` environment. Dispatch with `provider=openai` to force
+that backend even when an Anthropic token is also configured (otherwise `auto`
+keeps using Anthropic whenever that secret exists). Claude default model
+inputs are then rewritten to `gpt-5.6-sol`; every proposer and benchmark
+session receives `--effort xhigh`.
 
 Caveats, honestly:
 
-- Both arms run on the same model, so the *comparison* stays fair at any
+- Both arms run on the same model, so the _comparison_ stays fair at any
   quality level — but small free models follow skills less reliably, so
   expect lower resolve rates and noisier savings than on frontier models.
   Treat free-model runs as directional; confirm headline numbers with a
@@ -311,16 +663,16 @@ Three task classes × three arms, single-repo (GitNexus itself). **Every arm
 resolved every task** — at this difficulty, pass/fail quality is saturated
 and the comparison is pure cost:
 
-| task (class) | arm | resolved | cost $ | wall | turns | vs baseline cost |
-| --- | --- | --- | --- | --- | --- | --- |
-| trivial-version-alias | workflow | 1/1 | 9.16 | 16m | 63 | −333% |
-| trivial-version-alias | baseline | 1/1 | 2.11 | 2.8m | 16 | — |
-| inv-bug-pdg-note | workflow | 1/1 | 14.56 | 21m | 83 | −331% |
-| inv-bug-pdg-note | workflow_direct | 1/1 | 5.23 | 7.5m | 32 | −55% |
-| inv-bug-pdg-note | baseline | 1/1 | 3.38 | 4.7m | 22 | — |
-| inv-feature-list-repos-filter | workflow | 1/1 | 13.22 | 19m | 84 | −211% |
-| inv-feature-list-repos-filter | workflow_direct | 1/1 | 4.87 | 4.8m | 38 | −15% (wall +14% faster) |
-| inv-feature-list-repos-filter | baseline | 1/1 | 4.25 | 5.5m | 32 | — |
+| task (class)                  | arm             | resolved | cost $ | wall | turns | vs baseline cost        |
+| ----------------------------- | --------------- | -------- | ------ | ---- | ----- | ----------------------- |
+| trivial-version-alias         | workflow        | 1/1      | 9.16   | 16m  | 63    | −333%                   |
+| trivial-version-alias         | baseline        | 1/1      | 2.11   | 2.8m | 16    | —                       |
+| inv-bug-pdg-note              | workflow        | 1/1      | 14.56  | 21m  | 83    | −331%                   |
+| inv-bug-pdg-note              | workflow_direct | 1/1      | 5.23   | 7.5m | 32    | −55%                    |
+| inv-bug-pdg-note              | baseline        | 1/1      | 3.38   | 4.7m | 22    | —                       |
+| inv-feature-list-repos-filter | workflow        | 1/1      | 13.22  | 19m  | 84    | −211%                   |
+| inv-feature-list-repos-filter | workflow_direct | 1/1      | 4.87   | 4.8m | 38    | −15% (wall +14% faster) |
+| inv-feature-list-repos-filter | baseline        | 1/1      | 4.25   | 5.5m | 32    | —                       |
 
 What the ground base says, honestly:
 
@@ -335,7 +687,7 @@ What the ground base says, honestly:
   detect_changes-before-commit) is cheap. It produced noticeably more test
   coverage than baseline for near-equal cost on the feature task.
 - **Quality didn't differentiate because nothing failed.** The regime where
-  the workflow should win on *resolve rate* — cross-module tasks where
+  the workflow should win on _resolve rate_ — cross-module tasks where
   baselines flail — is the unmeasured cell (`cross-module-parse-retry`), and
   the next thing to measure, ideally with `--runs 3+` on a free backend.
 - Caveats: n=1 per cell, one repo, one model; churn numbers from this run
@@ -353,11 +705,11 @@ If a future run shows the workflow flattering itself here, distrust the run.
 The hardest class — retry-with-backoff across the worker-pool/pipeline
 seams, transient-vs-deterministic classification:
 
-| arm | resolved | cost $ | wall | turns | churn |
-| --- | --- | --- | --- | --- | --- |
-| workflow | 1/1 | 18.32 | 37m | 107 | 4/+373/−17 |
-| **workflow_direct** | 1/1 | **9.53** | **15m** | **52** | 11/+244/−66 |
-| baseline | 1/1 | 18.03 | 34m | 98 | 6/+345/−69 |
+| arm                 | resolved | cost $   | wall    | turns  | churn       |
+| ------------------- | -------- | -------- | ------- | ------ | ----------- |
+| workflow            | 1/1      | 18.32    | 37m     | 107    | 4/+373/−17  |
+| **workflow_direct** | 1/1      | **9.53** | **15m** | **52** | 11/+244/−66 |
+| baseline            | 1/1      | 18.03    | 34m     | 98     | 6/+345/−69  |
 
 (The workflow_direct row is the clean re-run under clone isolation — the
 original was contaminated, see the integrity note below.)
@@ -391,14 +743,14 @@ category-priced freshness (`accept` for compact classes), per-category turn
 budgets, and the work-phase HEAD==pin fast path, the same
 `inv-bug-pdg-note` workflow cell re-measured (n=1):
 
-| | ground base | optimized | delta |
-| --- | --- | --- | --- |
-| resolved | ✅ | ✅ | — |
-| cost $ | 14.56 | 11.70 | **−20%** |
-| turns | 83 | 72 | −13% |
-| output tokens | 59,789 | 53,345 | −11% |
-| cache_read | 6.64M | 5.07M | −24% |
-| wall | 21m | 25m | +15% |
+|               | ground base | optimized | delta    |
+| ------------- | ----------- | --------- | -------- |
+| resolved      | ✅          | ✅        | —        |
+| cost $        | 14.56       | 11.70     | **−20%** |
+| turns         | 83          | 72        | −13%     |
+| output tokens | 59,789      | 53,345    | −11%     |
+| cache_read    | 6.64M       | 5.07M     | −24%     |
+| wall          | 21m         | 25m       | +15%     |
 
 Verified in-transcript: the compact form fired (115-line plan vs 209 for a
 simpler task pre-optimization), the plan session dropped 72→49 turns, and
@@ -411,8 +763,8 @@ this task class, so the routing rule above stands unchanged.
 ## Writing good tasks
 
 See `tasks.scenarios.yaml`. Small enough to finish headless, real enough to
-require investigation — the workflow's savings come from *not re-reading and
-not re-investigating*, which trivial tasks never exercise. Keep `verify` as a
+require investigation — the workflow's savings come from _not re-reading and
+not re-investigating_, which trivial tasks never exercise. Keep `verify` as a
 model-visible authored-test quality signal, and add an independent `oracle`
 whose source files live under `workflow_bench/oracles/`. Oracle commands must
 run only files staged beneath `$GITNEXUS_BENCH_ORACLE_ROOT`; for Vitest, include
@@ -422,7 +774,7 @@ carry build pre-hooks).
 
 ## Relation to the SWE-bench harness
 
-The rest of `eval/` benchmarks GitNexus *tools* inside a litellm agent loop
-(baseline vs graph-enhanced). This module benchmarks the *skill workflow*
+The rest of `eval/` benchmarks GitNexus _tools_ inside a litellm agent loop
+(baseline vs graph-enhanced). This module benchmarks the _skill workflow_
 inside the real CLI harness those skills ship for. Different question, same
 spirit: measure, don't assume.

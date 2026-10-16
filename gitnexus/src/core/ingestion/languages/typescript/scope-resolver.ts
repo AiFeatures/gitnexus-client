@@ -18,17 +18,19 @@ import { generateId } from '../../../../lib/utils.js';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
 import { populateClassOwnedMembers } from '../../scope-resolution/scope/walkers.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
+import { canonicalizeWorkspaceBindings } from '../../scope-resolution/scope/canonicalize-bindings.js';
+import { canonicalTypeScriptName } from './identifiers.js';
 import { simpleKey } from '../../scope-resolution/graph-bridge/node-lookup.js';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import { typescriptProvider } from '../typescript.js';
-import { loadTsconfigPaths, type TsconfigPaths } from '../../language-config.js';
-import { buildSuffixIndex, type SuffixIndex } from '../../import-resolvers/utils.js';
+import { typescriptModuleExports } from './module-exports.js';
+import { loadTsconfigIndex, type TsconfigIndex } from './tsconfig.js';
 import {
-  typescriptArityCompatibility,
-  typescriptMergeBindings,
-  resolveTsTarget,
-  type TsResolveContext,
-} from './index.js';
+  loadNodeWorkspacePackages,
+  type NodeWorkspacePackages,
+} from '../../import-resolvers/node-workspace-packages.js';
+import { indexOnlyElementType } from '../../type-extractors/shared.js';
+import { typescriptArityCompatibility, typescriptMergeBindings, resolveTsTarget } from './index.js';
 import {
   getNuxtAutoImportEntry,
   hasNuxtAutoImports,
@@ -38,7 +40,10 @@ import {
 
 /** Shape the orchestrator threads in via `RunScopeResolutionInput.resolutionConfig`. */
 interface TypescriptResolutionConfig {
-  readonly tsconfigPaths: TsconfigPaths | null;
+  /** Every tsconfig in the repo, `extends` resolved (#2953). */
+  readonly tsconfigs: TsconfigIndex | null;
+  /** Every in-repo `package.json`, for workspace-package resolution (#2953). */
+  readonly nodeWorkspacePackages: NodeWorkspacePackages | null;
   /** Nuxt/Nitro auto-import map. Null for non-Nuxt projects. */
   readonly nuxtAutoImports: NuxtAutoImportConfig | null;
 }
@@ -54,63 +59,44 @@ const TYPESCRIPT_TYPE_ONLY_BINDING_TYPES = new Set<NodeLabel>([
 ]);
 
 /**
- * Build a `resolveImportTarget` adapter that memoizes the workspace
- * file list, the lower-cased file list, and the per-pass `resolveCache`
- * across every import lookup in a single workspace pass. The
- * orchestrator passes the same `ReadonlySet` reference for every call
- * within a pass — we use that identity to detect when the workspace
- * changes and recompute the derived state lazily.
+ * Build the `resolveImportTarget` adapter.
  *
- * Without this memoization, `resolveTsTarget` re-derived
- * `allFileList` and `normalizedFileList` (both O(N_files)) and threw
- * away the `resolveCache` on every import — O(N_files × N_imports)
- * total work for what should be O(N_files + N_imports).
+ * No per-file-set memo any more: the suffix index it existed to amortize is
+ * gone with #2953. Real resolution derives nothing from the file list — every
+ * candidate comes from a config the repo declares, and checking one is a
+ * `Set.has` — so there is nothing left to cache per pass.
  */
 function makeTsResolveImportTarget(): ScopeResolver['resolveImportTarget'] {
-  interface PassCache {
-    readonly key: ReadonlySet<string>;
-    readonly allFilePaths: Set<string>;
-    readonly allFileList: readonly string[];
-    readonly normalizedFileList: readonly string[];
-    readonly index: SuffixIndex;
-    readonly resolveCache: Map<string, string | null>;
-  }
-  let cached: PassCache | null = null;
-
   return (targetRaw, fromFile, allFilePaths, resolutionConfig) => {
-    if (cached === null || cached.key !== allFilePaths) {
-      const allFileList = Array.from(allFilePaths);
-      const normalizedFileList = allFileList.map((f) => f.toLowerCase());
-      cached = {
-        key: allFilePaths,
-        allFilePaths: new Set(allFilePaths),
-        allFileList,
-        normalizedFileList,
-        index: buildSuffixIndex(normalizedFileList, allFileList),
-        resolveCache: new Map(),
-      };
-    }
-
     const cfg = resolutionConfig as TypescriptResolutionConfig | undefined;
-    const ws: TsResolveContext = {
+    return resolveTsTarget(targetRaw, {
       fromFile,
-      allFilePaths: cached.allFilePaths,
-      allFileList: cached.allFileList,
-      normalizedFileList: cached.normalizedFileList,
-      index: cached.index,
-      resolveCache: cached.resolveCache,
-      tsconfigPaths: cfg?.tsconfigPaths ?? null,
-    };
-    return resolveTsTarget(targetRaw, ws);
+      allFilePaths,
+      tsconfigs: cfg?.tsconfigs ?? null,
+      nodeWorkspacePackages: cfg?.nodeWorkspacePackages ?? null,
+    });
   };
 }
 
 const typescriptScopeResolver: ScopeResolver = {
+  populateWorkspaceReferences: (parsedFiles) =>
+    canonicalizeWorkspaceBindings(parsedFiles, canonicalTypeScriptName),
+  // One hook, both routes. TypeScript exposes collection views as METHOD calls
+  // (`.values()`), which the call-expression branch already handles, so the
+  // accessor route yields nothing here — but it is now the same hook rather
+  // than a second one left undefined.
+  elementTypeOf: indexOnlyElementType,
+
+  // Construction is keyword-prefixed: `new Service(db).doWork()` (#2708).
+  constructionSyntax: { keyword: 'new' },
   language: SupportedLanguages.TypeScript,
   languageProvider: typescriptProvider,
   importEdgeReason: 'typescript-scope: import',
+  importsBindAtLexicalScope: true,
+  ownedMembersBindAtModuleScope: false,
 
   resolveImportTarget: makeTsResolveImportTarget(),
+  moduleExports: typescriptModuleExports,
 
   // Threaded into `resolveImportTarget` so tsconfig path aliases
   // (`@/services/user`, `~/x`, ...) resolve through the same standard
@@ -119,7 +105,8 @@ const typescriptScopeResolver: ScopeResolver = {
   // `nuxtAutoImports` is null for non-Nuxt projects (no .nuxt/imports.d.ts),
   // so this adds zero overhead to ordinary TypeScript repos.
   loadResolutionConfig: async (repoPath: string) => ({
-    tsconfigPaths: await loadTsconfigPaths(repoPath),
+    tsconfigs: await loadTsconfigIndex(repoPath),
+    nodeWorkspacePackages: await loadNodeWorkspacePackages(repoPath),
     nuxtAutoImports: await loadNuxtAutoImports(repoPath),
   }),
 
@@ -153,10 +140,19 @@ const typescriptScopeResolver: ScopeResolver = {
   fieldFallbackOnMethodLookup: false,
   propagatesReturnTypesAcrossImports: true,
 
-  // TypeScript uses `.values()` / `.keys()` method-call syntax for
-  // collection views -- no property-style accessors like C#'s
-  // `Dictionary<K,V>.Values`. Leave `unwrapCollectionAccessor`
-  // undefined and let the regular member-call branch handle them.
+  // ECMAScript: `export * from './a'; export * from './b'` with a name declared
+  // in both exports NEITHER — the finalize pass refuses the binding instead of
+  // taking the first-listed source (see `exclusiveWildcardReexports`).
+  exclusiveWildcardReexports: true,
+  // `import { x }` never reaches a class member: named imports and named
+  // re-exports bind to module-level declarations only (a class method sharing
+  // a name with a top-level value must not win the callable preference).
+  namedImportsBindTopLevelOnly: true,
+
+  // TypeScript uses `.values()` / `.keys()` method-call syntax for collection
+  // views -- no property-style accessors like C#'s `Dictionary<K,V>.Values` --
+  // so `elementTypeOf` answers only the `index` route and lets the regular
+  // member-call branch handle the rest.
   //
   // `collapseMemberCallsByCallerTarget` left undefined (= false) --
   // TypeScript legacy DAG emits one edge per call site, so
@@ -309,6 +305,8 @@ function hasLocalBindingInScopeChain(
     visited.add(cursor);
     const scope = indexes.scopeTree.getScope(cursor);
     if (!scope) return false;
+    if (scope.nameClaims?.some((claim) => claim.name === name && claim.purpose !== 'type'))
+      return true;
 
     const localBindings = scope.bindings.get(name);
     if (
@@ -329,15 +327,6 @@ function hasLocalBindingInScopeChain(
     // belongs to callable space, so a same-file presence check here cannot
     // over-suppress a legitimate auto-import.
     //
-    // Residual (known limitation): this catches parameters whose annotation the
-    // TS scope query records as a type-binding (`p: Named`, generics, unions,
-    // predefined, arrays). Function-typed params (`p: () => void`), untyped
-    // params, destructured locals (`const { x } = …`), and catch-clause vars
-    // are captured by NEITHER map — the scope query emits no `@declaration` /
-    // `@type-binding` for them — so those shadow forms still leak an edge.
-    // Closing that needs shared TS scope-query/extractor changes that alter call
-    // resolution beyond Nuxt, so it is deferred to a follow-up rather than fixed
-    // here.
     if (scope.filePath === filePath && scope.typeBindings.has(name)) {
       return true;
     }

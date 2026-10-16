@@ -17,6 +17,51 @@ import {
   type PipelineResult,
 } from './helpers.js';
 
+describe('Ruby nested method declarations remain visible on the outer method surface', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'ruby-nested-method'), () => {});
+  }, 60000);
+
+  it('resolves a sibling caller to the nested method despite a same-name method elsewhere', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const edge = calls.find(
+      (candidate) =>
+        candidate.source === 'caller' && candidate.rel.targetId.includes('boot.target'),
+    );
+    expect(edge).toBeDefined();
+  });
+
+  it('does not project a receiver-rebinding block method onto the lexical class', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (candidate) => candidate.source === 'class_eval_caller' && candidate.target === 'rebound',
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it.each([
+    ['commented_caller', 'commented_target', 'boot_commented.commented_target'],
+    ['class_caller', 'class_target', 'Host.boot_class.class_target'],
+  ])(
+    'resolves %s to its nested method despite a competing class member',
+    (caller, target, owner) => {
+      const calls = getRelationships(result, 'CALLS').filter(
+        (candidate) => candidate.source === caller && candidate.target === target,
+      );
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.rel.targetId).toContain(owner);
+    },
+  );
+
+  it('does not project a method through an unknown helper that rebinds the block definee', () => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (candidate) => candidate.source === 'helper_caller' && candidate.target === 'helper_target',
+    );
+    expect(calls).toEqual([]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Heritage: require_relative imports + include heritage + attr_* properties + calls
 // ---------------------------------------------------------------------------
@@ -1776,5 +1821,86 @@ describe('Ruby qualified mixin arg — IMPLEMENTS not corrupted by :: (issue #19
     // KTD3: discriminate on the resolved node id (the pre-fix bug dropped the edge).
     expect(e!.rel.sourceId).toContain('Consumer');
     expect(e!.rel.targetId).toContain('Mixin');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Inline constructor receiver: Service.new.do_work (#2708)
+// Ruby spells construction as a selector on the class, with or without an
+// argument list, so both `Service.new.do_work` and `Service.new(1).do_work`
+// have to type the receiver as an instance of Service.
+// ---------------------------------------------------------------------------
+
+describe('Ruby inline constructor receiver resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'ruby-inline-constructor-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves Service.new.do_work and Service.new(1).do_work to Service#do_work', () => {
+    const calls = getRelationships(result, 'CALLS');
+    for (const source of ['route_inline', 'route_inline_args']) {
+      const call = calls.find((c) => c.source === source && c.target === 'do_work');
+      expect(call, `${source} -> do_work`).toMatchObject({
+        source,
+        target: 'do_work',
+        targetFilePath: 'lib/svc.rb',
+      });
+    }
+  });
+
+  it('keeps the two-step spelling resolving to Service#do_work', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const twoStep = calls.find((c) => c.source === 'route_twostep' && c.target === 'do_work');
+    expect(twoStep).toMatchObject({ target: 'do_work', targetFilePath: 'lib/svc.rb' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Construction selector vs. an ordinary member named `new` (#2708 follow-up)
+// `Factory.new` constructs, but `factory.new` calls an instance method named
+// `new`, and a class-level `new` carrying a recorded return type must keep it.
+// The selector rule is a fallback behind the return-type lookup, not a
+// short-circuit ahead of it.
+// ---------------------------------------------------------------------------
+
+describe('Ruby construction selector vs. a real `new` member', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'ruby-construction-selector'), () => {});
+  }, 60000);
+
+  it('treats `Factory.new.run` as construction — Factory#run', () => {
+    const call = getRelationships(result, 'CALLS').find(
+      (c) => c.source === 'via_class_constant' && c.target === 'run',
+    );
+    expect(call).toMatchObject({ target: 'run' });
+    expect(call!.rel.targetId).toContain('Factory');
+  });
+
+  it('resolves `factory.new.run` through the instance method — Product#run', () => {
+    const call = getRelationships(result, 'CALLS').find(
+      (c) => c.source === 'via_instance' && c.target === 'run',
+    );
+    expect(call).toMatchObject({ target: 'run' });
+    expect(call!.rel.targetId).toContain('Product');
+  });
+
+  // KNOWN LIMITATION, asserted so a future change to it is deliberate: a
+  // class-level `def self.new` returning another type is still read as
+  // construction. The scope model records no staticness per member, so
+  // `def new` and `def self.new` are indistinguishable at this layer —
+  // distinguishing them needs the provider to record it first.
+  it('reads an overridden class-level `new` as construction (documented limitation)', () => {
+    const call = getRelationships(result, 'CALLS').find(
+      (c) => c.source === 'via_annotated_return' && c.target === 'run',
+    );
+    expect(call).toMatchObject({ target: 'run' });
+    expect(call!.rel.targetId).toContain('Annotated');
   });
 });

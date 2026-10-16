@@ -8,6 +8,7 @@ import {
 import { getCppParser, getCppScopeQuery } from './query.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
+import { stripUeMacros } from '../../cpp-ue-preprocessor.js';
 import { normalizeQualifiedName } from '../../utils/qualified-name.js';
 import { splitCppInclude, splitCppUsingDecl } from './import-decomposer.js';
 import {
@@ -23,7 +24,13 @@ import { markCppInlineNamespaceRange } from './inline-namespaces.js';
 import { extractCppTemplateConstraints } from './constraint-extractor.js';
 import { captureCppMemberLookupFacts } from './member-lookup.js';
 import { CPP_BRACED_INIT_TYPE_PREFIX } from './conversion-rank.js';
+import {
+  attachCppUsingClaims,
+  recordCppUsingDeclaration,
+  resetCppUsingDeclarations,
+} from './using-bindings.js';
 import { logger } from '../../../logger.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
 import {
   synthesizeCallableFlowCaptures,
   type CallableCaptureSignature,
@@ -158,13 +165,18 @@ export function emitCppScopeCaptures(
 ): readonly CaptureMatch[] {
   let tree = cachedTree as ReturnType<ReturnType<typeof getCppParser>['parse']> | undefined;
   if (tree === undefined) {
-    tree = parseSourceSafe(getCppParser(), sourceText, undefined, {
-      bufferSize: getTreeSitterBufferSize(sourceText),
+    // Idempotent re-application: `extractParsedFile` already preprocesses, but
+    // direct emitter callers (benchmarks, capture goldens) must see the same
+    // program the pipeline does.
+    const parseText = stripUeMacros(sourceText);
+    tree = parseSourceSafe(getCppParser(), parseText, undefined, {
+      bufferSize: getTreeSitterBufferSize(parseText),
     });
   }
 
   const rawMatches = getCppScopeQuery().matches(tree.rootNode);
   const out: CaptureMatch[] = [];
+  resetCppUsingDeclarations(filePath);
 
   // #2432: reset the per-file lookup index. The identifier-argument type
   // lookups below used to re-walk the AST per identifier (full-tree DFS in
@@ -232,6 +244,7 @@ export function emitCppScopeCaptures(
       if (usingNode !== null) {
         const split = splitCppUsingDecl(usingNode);
         if (split !== null) {
+          recordCppUsingDeclaration(filePath, split);
           out.push(split);
           continue;
         }
@@ -413,15 +426,11 @@ export function emitCppScopeCaptures(
     }
 
     if (operatorAnchor !== undefined && grouped['@reference.name'] === undefined) {
-      // The old code did `findNodeAtRange(tree.rootNode, operatorAnchor.range,
-      // operatorAnchor.text)`, searching for a node of type `+` / `<<` at the
-      // operator-token range. That token is an UNNAMED grammar node, and
-      // findNodeAtRange only descends `namedChild`ren, so the search NEVER hit
-      // and ALWAYS fell back to `tree.rootNode`. Use `tree.rootNode` directly to
-      // preserve the exact synthetic-capture range while dropping the root-walk.
+      // Synthetic operator names still refer to the written operator token.
+      // A translation-unit range makes distinct operators share one identity.
       grouped['@reference.name'] = syntheticCapture(
         '@reference.name',
-        tree.rootNode,
+        nodeMap['@reference.operator']!,
         `operator${operatorAnchor.text}`,
       );
     }
@@ -604,6 +613,22 @@ export function emitCppScopeCaptures(
       }
     }
 
+    const parameterNode = nodeMap['@type-binding.parameter'];
+    const parameterCapture = grouped['@type-binding.parameter'];
+    if (parameterNode !== undefined && parameterCapture !== undefined) {
+      // Parameter names in a prototype or nested function-pointer type are
+      // not locals in the containing function. Arity metadata still comes
+      // from the declaration AST, independently of these local type facts.
+      if (!isCppLexicalParameter(parameterNode)) continue;
+      grouped['@type-binding.lexical-parameter'] = parameterCapture;
+    }
+
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 
@@ -626,7 +651,23 @@ export function emitCppScopeCaptures(
   captureCppMemberLookupFacts(tree.rootNode, filePath);
 
   out.push(...synthesizeCallableFlowCaptures(tree.rootNode, CPP_CALLABLE_CAPTURE_OPTIONS));
+  attachCppUsingClaims(out, filePath);
   return out;
+}
+
+/** Prototype and nested function-pointer parameter names do not bind the body. */
+function isCppLexicalParameter(node: SyntaxNode): boolean {
+  for (let parent = node.parent; parent !== null; parent = parent.parent) {
+    if (parent.type === 'function_definition' || parent.type === 'lambda_expression') return true;
+    if (
+      parent.type === 'declaration' ||
+      parent.type === 'field_declaration' ||
+      parent.type === 'parameter_declaration' ||
+      parent.type === 'optional_parameter_declaration'
+    )
+      return false;
+  }
+  return false;
 }
 
 function cppFunctionDeclaratorSignature(node: SyntaxNode): CallableCaptureSignature | undefined {

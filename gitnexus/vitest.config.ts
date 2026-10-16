@@ -8,13 +8,23 @@ export default defineConfig({
     hookTimeout: 120000,
     pool: 'forks',
     globals: true,
+    // Keep the Vitest 4 mock lifecycle while upgrading the runner to Vitest 5.
+    clearMocks: false,
+    // Stable test identity across the Linux/macOS/Windows execution receipts.
+    includeTaskLocation: true,
     teardownTimeout: 3000,
     // E2E harnesses pin a small NODE_OPTIONS heap so spawned CLI children
     // stay light; without this opt-out the #2649 auto-heap override would
     // respawn every such child with a RAM-sized cap. Children inherit it via
     // the harnesses' `{ ...process.env }` spreads. Tests that exercise the
     // respawn behavior itself delete GITNEXUS_MEMORY in their own setup.
-    env: { GITNEXUS_MEMORY: 'off' },
+    // Tests assert the English CLI contract unless a case opts into another
+    // language explicitly. Do not inherit a developer shell's CLI locale.
+    // GITNEXUS_ATOMIC_INCREMENTAL=0 is an operator off-switch that beats a
+    // caller's `atomicIncremental: true`, so an exported `=0` would silently
+    // turn off every staging test. Empty is neither '0' nor '1', i.e. unset;
+    // a test that needs a value stubs it.
+    env: { GITNEXUS_MEMORY: 'off', GITNEXUS_LANG: 'en', GITNEXUS_ATOMIC_INCREMENTAL: '' },
     // N-API destructors can crash worker forks on macOS during process exit.
     // This is independent of the QueryResult lifetime fix in @ladybugdb/core 0.15.2 —
     // it's a vitest forks + native addon interaction where destructors run in
@@ -64,12 +74,30 @@ export default defineConfig({
         test: {
           name: 'lbug-db',
           include: [
+            'test/integration/rename-provider-*.test.ts',
+            'test/integration/pdg-explicit-owner.test.ts',
+            'test/integration/skip-fts.test.ts',
+            'test/integration/impact-callable-value-references.test.ts',
+            'test/integration/impact-context-integrity.test.ts',
+            'test/integration/incremental-worktree-context.test.ts',
+            'test/integration/incremental-method-integrity.test.ts',
+            'test/integration/go-incremental-method-owners.test.ts',
+            'test/integration/query-symbol-integrity.test.ts',
+            'test/integration/mcp-index-generation.test.ts',
+            'test/integration/fts-repair-warm-session.test.ts',
+            'test/integration/impact-epistemic-lower-bound.test.ts',
+            'test/integration/impact-scope-omission-persistence.test.ts',
             'test/integration/lbug-core-adapter.test.ts',
             'test/integration/lbug-vector-extension.test.ts',
             'test/integration/lbug-pool.test.ts',
             'test/integration/lbug-pool-stability.test.ts',
             'test/integration/local-backend.test.ts',
             'test/integration/local-backend-calltool.test.ts',
+            'test/integration/spring-aop-mcp.test.ts',
+            // Native @ladybugdb/core: loads a real graph through loadGraphToLbug
+            // and asserts the Destination NULL/join invariant on the stored rows.
+            'test/integration/spring-destinations-lbug.test.ts',
+            'test/integration/spring-destinations-incremental.test.ts',
             'test/integration/search-core.test.ts',
             'test/integration/search-pool.test.ts',
             'test/integration/fts-description-search.test.ts',
@@ -85,19 +113,59 @@ export default defineConfig({
             'test/integration/java-class-impact.test.ts',
             'test/integration/class-impact-all-languages.test.ts',
             'test/integration/lbug-orphan-sidecar-recovery.test.ts',
+            'test/integration/lbug-interrupted-checkpoint-recovery.test.ts',
+            'test/integration/lbug-incremental-search.test.ts',
             'test/integration/lbug-readonly-init.test.ts',
+            // Shared sibling store (#3352): each file runs real analyses and opens
+            // the resulting LadybugDB graphs.
+            'test/integration/shared-store-analyze.test.ts',
+            'test/integration/shared-store-seed.test.ts',
+            'test/integration/shared-store-cache.test.ts',
+            'test/integration/shared-store-clean.test.ts',
+            'test/integration/shared-store-clone-optin.test.ts',
+            'test/integration/shared-store-adoption.test.ts',
             'test/integration/analyze-wal-checkpoint-failure.test.ts',
             'test/integration/lbug-non-ascii-path.test.ts',
             'test/integration/lbug-conn-serialization.test.ts',
+            'test/integration/lbug-load-overlap-errors.test.ts',
+            'test/integration/load-cached-embeddings-spill.test.ts',
             'test/integration/group/manifest-resolve-symbol-2325.test.ts',
+            'test/integration/group/manifest-synthetic-impact-lbug.test.ts',
             'test/integration/group/http-route-resolve-symbol.test.ts',
+            'test/integration/group/graphql-resolve-symbol.test.ts',
             'test/integration/fts-stemmer-sweep.test.ts',
             'test/integration/lbug-multiwriter-deadlock.test.ts',
             'test/integration/extension-binary-real.test.ts',
             'test/integration/lbug-delete-nodes-for-files.test.ts',
             'test/integration/lbug-query-importers-batch.test.ts',
+            'test/integration/impact-ambiguous-blast-radius.test.ts',
+            // #2915. Native @ladybugdb/core via withTestLbugDB(poolAdapter:true),
+            // and it drives detect_changes over a real git repo — the mmap
+            // file-lock exposure this project serializes (TESTING.md § Vitest
+            // projects), on the Windows/macOS platforms #2915 was reported from.
+            'test/integration/detect-changes-path-anchoring.test.ts',
+            // #2915. Native @ladybugdb/core via withTestLbugDB(poolAdapter:true) —
+            // the wiki's graph queries executed by a real engine rather than a
+            // fake that answers on `query.includes(...)`.
+            'test/integration/wiki-graph-queries-engine.test.ts',
             'test/unit/incremental-dirty-recovery.test.ts',
+            // Publication reconciliation uses real native COPY/checkpoints.
+            'test/unit/incremental-write-integrity.test.ts',
             'test/unit/incremental-orchestration.test.ts',
+            // #2841. Native @ladybugdb/core: it runs real analyses, reopens the
+            // DB under different extension-install policies, and reads
+            // SHOW_INDEXES on the writable connection — exactly the mmap
+            // file-lock exposure this project exists to serialize (TESTING.md
+            // § Vitest projects). Registering it here does NOT narrow where it
+            // runs: vitest applies `--shard` once to the combined cross-project
+            // spec list (PerfSequencer/assignShards is a complete, disjoint
+            // partition), and run-cross-platform.ts hands vitest explicit file
+            // paths, which resolve against every project's include list. Its
+            // `incremental-vector-extension-ordering` /
+            // `incremental-fts-drop-ordering` siblings are equally native and
+            // still sit in `default` — pre-existing drift, deliberately left
+            // alone here.
+            'test/unit/incremental-index-extension-dml-gate.test.ts',
           ],
           fileParallelism: false,
           sequence: { groupOrder: 1 },
@@ -110,12 +178,28 @@ export default defineConfig({
           sequence: { groupOrder: 3 },
           include: ['test/**/*.test.ts'],
           exclude: [
+            'test/integration/rename-provider-*.test.ts',
+            'test/integration/pdg-explicit-owner.test.ts',
+            'test/integration/skip-fts.test.ts',
+            'test/integration/impact-callable-value-references.test.ts',
+            'test/integration/impact-context-integrity.test.ts',
+            'test/integration/incremental-worktree-context.test.ts',
+            'test/integration/incremental-method-integrity.test.ts',
+            'test/integration/go-incremental-method-owners.test.ts',
+            'test/integration/query-symbol-integrity.test.ts',
+            'test/integration/mcp-index-generation.test.ts',
+            'test/integration/fts-repair-warm-session.test.ts',
+            'test/integration/impact-epistemic-lower-bound.test.ts',
+            'test/integration/impact-scope-omission-persistence.test.ts',
             'test/integration/lbug-core-adapter.test.ts',
             'test/integration/lbug-vector-extension.test.ts',
             'test/integration/lbug-pool.test.ts',
             'test/integration/lbug-pool-stability.test.ts',
             'test/integration/local-backend.test.ts',
             'test/integration/local-backend-calltool.test.ts',
+            'test/integration/spring-aop-mcp.test.ts',
+            'test/integration/spring-destinations-lbug.test.ts',
+            'test/integration/spring-destinations-incremental.test.ts',
             'test/integration/search-core.test.ts',
             'test/integration/search-pool.test.ts',
             'test/integration/fts-description-search.test.ts',
@@ -131,12 +215,18 @@ export default defineConfig({
             'test/integration/java-class-impact.test.ts',
             'test/integration/class-impact-all-languages.test.ts',
             'test/integration/lbug-orphan-sidecar-recovery.test.ts',
+            'test/integration/lbug-interrupted-checkpoint-recovery.test.ts',
+            'test/integration/lbug-incremental-search.test.ts',
             'test/integration/lbug-readonly-init.test.ts',
             'test/integration/analyze-wal-checkpoint-failure.test.ts',
             'test/integration/lbug-non-ascii-path.test.ts',
             'test/integration/lbug-conn-serialization.test.ts',
+            'test/integration/lbug-load-overlap-errors.test.ts',
+            'test/integration/load-cached-embeddings-spill.test.ts',
             'test/integration/group/manifest-resolve-symbol-2325.test.ts',
+            'test/integration/group/manifest-synthetic-impact-lbug.test.ts',
             'test/integration/group/http-route-resolve-symbol.test.ts',
+            'test/integration/group/graphql-resolve-symbol.test.ts',
             'test/integration/skills-e2e.test.ts',
             'test/integration/fts-extension-e2e.test.ts',
             'test/integration/fts-stemmer-sweep.test.ts',
@@ -144,8 +234,21 @@ export default defineConfig({
             'test/integration/extension-binary-real.test.ts',
             'test/integration/lbug-delete-nodes-for-files.test.ts',
             'test/integration/lbug-query-importers-batch.test.ts',
+            'test/integration/impact-ambiguous-blast-radius.test.ts',
+            'test/integration/detect-changes-path-anchoring.test.ts',
+            'test/integration/wiki-graph-queries-engine.test.ts',
             'test/unit/incremental-dirty-recovery.test.ts',
+            'test/unit/incremental-write-integrity.test.ts',
             'test/unit/incremental-orchestration.test.ts',
+            // Excluded here because it is included by `lbug-db` above; a file
+            // in two projects would be collected (and run) twice.
+            'test/unit/incremental-index-extension-dml-gate.test.ts',
+            'test/integration/shared-store-analyze.test.ts',
+            'test/integration/shared-store-seed.test.ts',
+            'test/integration/shared-store-cache.test.ts',
+            'test/integration/shared-store-clean.test.ts',
+            'test/integration/shared-store-clone-optin.test.ts',
+            'test/integration/shared-store-adoption.test.ts',
           ],
         },
       },

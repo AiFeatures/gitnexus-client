@@ -14,6 +14,7 @@ import { CommunityNode, CommunityMembership } from '../core/ingestion/community-
 import { ProcessNode } from '../core/ingestion/process-processor.js';
 import { KnowledgeGraph } from '../core/graph/types.js';
 import { shouldMirrorSkillsToAgents } from './ai-context.js';
+import type { GeneratedSkillInfo } from './generated-skill.js';
 
 const GENERATED_SKILL_PREFIX = 'gitnexus-area-';
 const MAX_SKILL_NAME_LENGTH = 64;
@@ -22,13 +23,6 @@ const MAX_COMMUNITY_NAME_LENGTH = MAX_SKILL_NAME_LENGTH - GENERATED_SKILL_PREFIX
 // ============================================================================
 // TYPES
 // ============================================================================
-
-export interface GeneratedSkillInfo {
-  name: string;
-  label: string;
-  symbolCount: number;
-  fileCount: number;
-}
 
 interface AggregatedCommunity {
   label: string;
@@ -120,21 +114,21 @@ export const generateSkillFiles = async (
     }
   }
 
-  if (!communityResult || !communityResult.memberships.length) {
+  const memberships = communityResult?.rawMemberships ?? communityResult?.memberships ?? [];
+  if (!communityResult || !memberships.length) {
     console.log('\n  Skills: no communities detected, skipping skill generation');
     return { skills: [], outputPath: outputDir };
   }
 
   console.log('\n  Generating repo-specific skills...');
 
-  // Step 1: Build communities from memberships (not the filtered communities array).
-  // The community processor skips singletons from its communities array but memberships
-  // include ALL assignments. For repos with sparse CALLS edges, the communities array
-  // can be empty while memberships still has useful groupings.
+  // Step 1: Use raw assignments for the fallback when all communities were
+  // filtered as singletons. Same-folder aggregation can still produce skills
+  // for these sparse graphs without emitting dangling MEMBER_OF edges.
   const communities =
     communityResult.communities.length > 0
       ? communityResult.communities
-      : buildCommunitiesFromMemberships(communityResult.memberships, graph, repoPath);
+      : buildCommunitiesFromMemberships(memberships, graph, repoPath);
 
   const aggregated = aggregateCommunities(communities);
 
@@ -151,11 +145,8 @@ export const generateSkillFiles = async (
   }
 
   // Step 3: Build lookup maps
-  const membershipsByComm = buildMembershipMap(communityResult.memberships);
-  const nodeIdToCommunityLabel = buildNodeCommunityLabelMap(
-    communityResult.memberships,
-    communities,
-  );
+  const membershipsByComm = buildMembershipMap(memberships);
+  const nodeIdToCommunityLabel = buildNodeCommunityLabelMap(memberships, communities);
 
   // Step 4: Ensure the shared project-skill root exists. Never clear it: it
   // also contains user-authored and standard GitNexus skills.
@@ -191,7 +182,7 @@ export const generateSkillFiles = async (
     const entryPoints = gatherEntryPoints(members);
 
     // Gather execution flows
-    const flows = gatherFlows(community.rawIds, processResult?.processes || []);
+    const flows = gatherFlows(community.rawIds, members, processResult?.processes || []);
 
     // Gather cross-community connections
     const connections = gatherCrossConnections(
@@ -535,14 +526,26 @@ const gatherEntryPoints = (members: MemberSymbol[]): MemberSymbol[] => {
 /**
  * @brief Gather execution flows touching this community
  * @param {string[]} rawIds - Raw community IDs for this aggregated community
+ * @param {MemberSymbol[]} members - Member symbols, including raw singleton assignments
  * @param {ProcessNode[]} processes - All detected processes
- * @returns {ProcessNode[]} Processes whose communities intersect rawIds, sorted by stepCount
+ * @returns {ProcessNode[]} Processes matching the community IDs or member symbols, sorted by stepCount
  */
-const gatherFlows = (rawIds: string[], processes: ProcessNode[]): ProcessNode[] => {
+const gatherFlows = (
+  rawIds: string[],
+  members: MemberSymbol[],
+  processes: ProcessNode[],
+): ProcessNode[] => {
   const rawIdSet = new Set(rawIds);
+  const memberIds = new Set(members.map((member) => member.id));
 
   return processes
-    .filter((proc) => proc.communities.some((cid) => rawIdSet.has(cid)))
+    .filter(
+      (proc) =>
+        proc.communities.some((cid) => rawIdSet.has(cid)) ||
+        // Filtered singleton communities are absent from process metadata,
+        // but their symbols still participate in detected execution traces.
+        proc.trace.some((nodeId) => memberIds.has(nodeId)),
+    )
     .sort((a, b) => b.stepCount - a.stepCount);
 };
 

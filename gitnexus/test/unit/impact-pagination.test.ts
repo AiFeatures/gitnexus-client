@@ -4,7 +4,7 @@ const executeQueryMock = vi.fn();
 const executeParameterizedMock = vi.fn();
 
 vi.mock('../../src/core/lbug/pool-adapter.js', async (importOriginal) => {
-  const actual = await importOriginal();
+  const actual = await importOriginal<typeof import('../../src/core/lbug/pool-adapter.js')>();
   return {
     ...actual,
     initLbug: vi.fn(),
@@ -15,7 +15,7 @@ vi.mock('../../src/core/lbug/pool-adapter.js', async (importOriginal) => {
   };
 });
 vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
-  const actual = await importOriginal();
+  const actual = await importOriginal<typeof import('../../src/mcp/core/lbug-adapter.js')>();
   return {
     ...actual,
     initLbug: vi.fn(),
@@ -26,8 +26,8 @@ vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
   };
 });
 
-import { LocalBackend } from '../../src/mcp/local/local-backend';
-import { collectImpactSymbolUids } from '../../src/core/group/cross-impact';
+import { LocalBackend } from '../../src/mcp/local/local-backend.js';
+import { collectImpactSymbolUids } from '../../src/core/group/cross-impact.js';
 
 function makeBackend() {
   const backend = new LocalBackend();
@@ -56,6 +56,7 @@ function setupMultiDepthHub(d1Count: number, d2Count: number) {
     const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
     if (query.includes('STEP_IN_PROCESS')) return [];
     if (query.includes('MEMBER_OF')) return [];
+    if (query.includes('RETURN h.id AS hid')) return [];
     // The #1858 epistemic-boundary probe (computeEpistemicBoundary) runs
     // concurrently with the BFS and also matches `r.type IN`, but targets the
     // `iface` alias. Return empty so it stays `epistemic: 'exact'` and does not
@@ -82,11 +83,24 @@ function setupMultiDepthHub(d1Count: number, d2Count: number) {
   executeQueryMock.mockImplementation(async () => []);
 }
 
+// `impacted` is ordered by node id, and ids are STRINGS — so `caller-107` sorts
+// before `caller-11`, not after. That was always production's order (the frontier
+// query used to carry `ORDER BY id`), but the mock returns rows unsorted and the
+// old code trusted the DB, so these expectations used to encode the mock's numeric
+// insertion order — an order the real engine never produced. #2787 moved the sort
+// into JS, which is what finally makes the mocked path agree with production.
+/** The nth caller in id (code-unit) order, matching what `_impactImpl` returns. */
+function callerAtIndex(total: number, index: number): string {
+  const sorted = Array.from({ length: total }, (_, i) => `caller-${i}`).sort();
+  return sorted[index].replace('caller-', 'caller');
+}
+
 function setupHubSymbol(count: number) {
   executeParameterizedMock.mockImplementation(async (...args: any[]) => {
     const query = typeof args[1] === 'string' ? args[1] : String(args[0] ?? '');
     if (query.includes('STEP_IN_PROCESS')) return [];
     if (query.includes('MEMBER_OF')) return [];
+    if (query.includes('RETURN h.id AS hid')) return [];
     // See setupMultiDepthHub — keep the #1858 epistemic probe from matching the
     // `r.type IN` caller branch below.
     if (query.includes('iface')) return [];
@@ -164,7 +178,7 @@ describe('impact: pagination and summaryOnly (#414)', () => {
     });
 
     expect(res.byDepth[1].length).toBe(20);
-    expect(res.byDepth[1][0].name).toBe('caller10');
+    expect(res.byDepth[1][0].name).toBe(callerAtIndex(200, 10));
     expect(res.pagination).toEqual({
       limit: 20,
       offset: 10,
@@ -362,7 +376,7 @@ describe('impact: pagination and summaryOnly (#414)', () => {
     });
 
     expect(res.byDepth[1].length).toBe(20);
-    expect(res.byDepth[1][0].name).toBe('caller5');
+    expect(res.byDepth[1][0].name).toBe(callerAtIndex(50, 5));
     expect(res.pagination.limit).toBe(20);
     expect(res.pagination.offset).toBe(5);
   });

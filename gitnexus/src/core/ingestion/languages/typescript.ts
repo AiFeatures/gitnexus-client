@@ -7,7 +7,7 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
-import type { NodeLabel } from 'gitnexus-shared';
+import type { CaptureMatch, NodeLabel } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
 import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
@@ -16,7 +16,61 @@ import {
   javascriptClassConfig,
 } from '../class-extractors/configs/typescript-javascript.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
-import { createLeadingDocDescriptionExtractor } from '../utils/ast-helpers.js';
+import {
+  createLeadingDocDescriptionExtractor,
+  isCjsDefaultExportAssignment,
+  isPrototypeMemberAssignmentNode,
+} from '../utils/ast-helpers.js';
+import {
+  cjsExportedNameFor,
+  isModuleLevelThisAssignment,
+  isModuleLevelThisExport,
+  isShadowedCjsExportAssignmentNode,
+} from './typescript/cjs-export-assignment.js';
+
+const rootOf = (node: SyntaxNode): SyntaxNode | undefined =>
+  (node as { tree?: { rootNode?: SyntaxNode } }).tree?.rootNode;
+
+/** `exports.X = fn` where the module already declares `X` — see #2723. */
+const isShadowedCjsExportNode = (node: SyntaxNode): boolean => {
+  const root = rootOf(node);
+  return root !== undefined && isShadowedCjsExportAssignmentNode(node, root);
+};
+
+/**
+ * Label for a `<receiver>.<member> = <function>` capture (#2723 follow-up).
+ *
+ * The member-assignment queries match ANY identifier receiver, because an
+ * `exports` alias (`const e = exports; e.foo = fn`) cannot be pinned in the
+ * query. Everything that is not a recognised shape is dropped HERE — without
+ * that, every `obj.handler = function () {}` in every JS/TS file would emit a
+ * spurious top-level `Function` named `handler`.
+ *
+ * Recognised: a CJS export (direct, `module.exports`, or via a module-scope
+ * alias) stays a Function; a prototype or `this` member becomes a Method; a
+ * CJS export shadowing a name the module already declares emits nothing.
+ */
+const memberAssignmentLabel = (node: SyntaxNode): NodeLabel | null => {
+  const root = rootOf(node);
+
+  // Module-level `this.X = fn` in CommonJS IS `module.exports.X = fn`, so it
+  // is an exported Function, not an instance member. Checked before the
+  // Method branch, which would otherwise claim every `this` receiver.
+  if (root !== undefined && isModuleLevelThisExport(node, root)) return 'Function';
+  // `module.exports = fn` — the module itself is the callable.
+  if (isCjsDefaultExportAssignment(node)) return 'Function';
+  // A module-level `this` member in ESM or a no-signal file is neither an
+  // export (top-level `this` is undefined) nor an instance member. Emitting a
+  // Method there minted an ownerless node (#2729 review F13).
+  if (isModuleLevelThisAssignment(node)) return null;
+  if (isPrototypeMemberAssignmentNode(node)) return 'Method';
+  if (isShadowedCjsExportNode(node)) return null;
+
+  const value = node.childForFieldName('right');
+  if (root === undefined || value === null) return null;
+
+  return cjsExportedNameFor(value, root) !== null ? 'Function' : null;
+};
 import { createTypeScriptCfgVisitor } from '../cfg/visitors/typescript.js';
 import { typeConfig as typescriptConfig } from '../type-extractors/typescript.js';
 import { tsExportChecker } from '../export-detection.js';
@@ -48,6 +102,7 @@ import {
   ARRAY_METHOD_HOC_BLOCKLIST_SET,
   DEFAULT_EXPORT_IDENTIFIER_BLOCKLIST_SET,
   deriveDefaultExportHocName,
+  isBlockedCallbackRegistrationCall,
 } from '../ts-js-hoc-utils.js';
 import {
   emitTsScopeCaptures,
@@ -70,6 +125,34 @@ import {
   jsMergeBindings,
   jsArityCompatibility,
 } from './javascript/index.js';
+import { extractDispatchGuardRoutes } from '../route-extractors/dispatch-guard.js';
+import { extractDataRouteTableRoutes } from '../route-extractors/data-route-table.js';
+import { extractNestRoutes } from '../route-extractors/nest.js';
+import { extractFetchWrapperCalls } from '../route-extractors/fetch-wrapper.js';
+import { extractTrpcRoutes, shouldScanForTrpcRoutes } from '../route-extractors/trpc.js';
+import { extractConvexEndpointProperties } from './typescript/convex-endpoint-metadata.js';
+import { extractToolDefinitions } from './typescript/tool-definitions.js';
+import { typescriptRenameProvider } from './typescript/rename.js';
+
+const extractJsTsRoutes = (...args: Parameters<typeof extractDispatchGuardRoutes>) => [
+  ...extractDispatchGuardRoutes(...args),
+  ...extractDataRouteTableRoutes(...args),
+  ...extractNestRoutes(...args),
+];
+
+const extractJsTsTextRoutes = (path: string, content: string) =>
+  shouldScanForTrpcRoutes(path) ? extractTrpcRoutes(path, content) : [];
+
+const pairKeyName = (keyNode: SyntaxNode | null | undefined): string | null => {
+  if (!keyNode) return null;
+  if (keyNode.type === 'property_identifier' || keyNode.type === 'identifier') {
+    return keyNode.text;
+  }
+  if (keyNode.type === 'string') {
+    return keyNode.children?.find((c: SyntaxNode) => c.type === 'string_fragment')?.text ?? null;
+  }
+  return null;
+};
 
 /**
  * TypeScript/JavaScript: arrow_function and function_expression are
@@ -124,20 +207,9 @@ const tsExtractFunctionName = (
   // tree-sitter-typescript uses `pair`; tree-sitter-javascript also exposes
   // `pair`. (Older grammars used `property_assignment`; we accept both.)
   if (parent.type === 'pair' || parent.type === 'property_assignment') {
-    const keyNode = parent.childForFieldName?.('key');
-    if (!keyNode) return { funcName: null, label: 'Function' };
-    if (keyNode.type === 'property_identifier' || keyNode.type === 'identifier') {
-      return { funcName: keyNode.text, label: 'Function' };
-    }
-    if (keyNode.type === 'string') {
-      // `"add-item": () => ...` — the literal text inside the quotes.
-      const fragment = keyNode.children?.find((c: SyntaxNode) => c.type === 'string_fragment');
-      const text = fragment?.text ?? null;
-      return { funcName: text, label: 'Function' };
-    }
     // computed_property_name (`[ACTION_KEY]`) and other dynamic keys have
-    // no static name — fall through anonymous.
-    return { funcName: null, label: 'Function' };
+    // no static name — pairKeyName returns null and we stay anonymous.
+    return { funcName: pairKeyName(parent.childForFieldName?.('key')), label: 'Function' };
   }
 
   // HOC-wrapped variable declarations: `const Button = forwardRef((p, r) => { ... })`,
@@ -202,6 +274,17 @@ const tsExtractFunctionName = (
         };
       }
       return { funcName: null, label: 'Function' };
+    }
+
+    // HOC-wrapped pair: `create: procedure.mutation(async ({ input }) => { ... })`.
+    // tRPC and similar frameworks wrap callbacks inside .mutation()/.query() calls
+    // that are themselves pair values. The arrow's parent is `arguments`,
+    // grandparent is `call_expression`, great-grandparent is `pair`.
+    if (declarator?.type === 'pair' || declarator?.type === 'property_assignment') {
+      if (isBlockedCallbackRegistrationCall(callExpr)) {
+        return { funcName: null, label: 'Function' };
+      }
+      return { funcName: pairKeyName(declarator.childForFieldName?.('key')), label: 'Function' };
     }
 
     return { funcName: null, label: 'Function' };
@@ -307,9 +390,22 @@ export const BUILT_INS: ReadonlySet<string> = new Set([
   'valueOf',
 ]);
 
+/**
+ * `this` is the only receiver keyword JavaScript and TypeScript bind, and it
+ * is bound by every function form except an arrow (#2701). The query files
+ * tag those forms with `@receiver-owner.this`; this hook just reads the tag,
+ * so the node-type list stays in the one place that already names grammar
+ * nodes. See `Scope.ownsReceivers` for what the marker does to the walk.
+ */
+const TS_OWNED_RECEIVERS: ReadonlySet<string> = new Set(['this']);
+
+const tsScopeOwnsReceivers = (match: CaptureMatch): ReadonlySet<string> | undefined =>
+  match['@receiver-owner.this'] === undefined ? undefined : TS_OWNED_RECEIVERS;
+
 export const typescriptProvider = defineLanguage({
   id: SupportedLanguages.TypeScript,
-  extensions: ['.ts', '.tsx'],
+  rename: typescriptRenameProvider,
+  extensions: ['.ts', '.tsx', '.mts', '.cts'],
   entryPointPatterns: [/^use[A-Z]/],
   astFrameworkPatterns: [
     {
@@ -332,9 +428,16 @@ export const typescriptProvider = defineLanguage({
         'expo-router',
       ],
     },
+    {
+      framework: 'trpc',
+      entryPointMultiplier: 3.0,
+      reason: 'trpc-procedure',
+      patterns: ['initTRPC', 'createTRPCRouter', '@trpc/server', '@trpc/client'],
+    },
   ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: TYPESCRIPT_QUERIES,
   typeConfig: typescriptConfig,
+  scopeOwnsReceivers: tsScopeOwnsReceivers,
   exportChecker: tsExportChecker,
   importResolver: createImportResolver(typescriptImportConfig),
   callExtractor: createCallExtractor(typescriptCallConfig),
@@ -344,6 +447,7 @@ export const typescriptProvider = defineLanguage({
     extractFunctionName: tsExtractFunctionName,
   }),
   variableExtractor: createVariableExtractor(typescriptVariableConfig),
+  definitionPropertiesExtractor: extractConvexEndpointProperties,
   classExtractor: createClassExtractor(typescriptClassConfig),
   // ── JSDoc → description (issue #2270). An exported decl is captured as the
   //    inner declaration; its JSDoc precedes the wrapping `export_statement`. ──
@@ -351,6 +455,21 @@ export const typescriptProvider = defineLanguage({
     wrapperNodeTypes: ['export_statement'],
   }),
   builtInNames: BUILT_INS,
+
+  // Member-assignment shapes are not free functions (#2723 follow-up). The
+  // capture arrives anchored on the assignment, so the shape is decided from
+  // the left-hand side:
+  //   - `Foo.prototype.bar = fn` / `this.bar = fn` -> a Method
+  //   - a CJS export shadowing a name the module already declares -> no node
+  //     at all, since the scope declaration that would reach it is suppressed
+  //     too (an orphan `Function` twin beside `class Dup {}` otherwise).
+  // Every other `definition.function` capture keeps its default label.
+  labelOverride: (functionNode, defaultLabel) =>
+    defaultLabel !== 'Function'
+      ? defaultLabel
+      : functionNode.type === 'assignment_expression'
+        ? memberAssignmentLabel(functionNode)
+        : defaultLabel,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
   // TypeScript is the third migration after Python and C#. See
@@ -372,11 +491,21 @@ export const typescriptProvider = defineLanguage({
   receiverBinding: tsReceiverBinding,
   arityCompatibility: typescriptArityCompatibility,
   resolveImportTarget: resolveTsImportTarget,
+  // A raw `node:http` server declares its routes by comparing the request path
+  // to a literal; nothing else in this pipeline can see that shape. TS and JS
+  // share the grammar, so they share the extractor.
+  extractDecoratorRoutes: extractJsTsRoutes,
+  extractFetchWrapperCalls,
+  // Content-based (not AST): tRPC procedure routers are scanned from source text.
+  // Path-gate lives here (language provider), not in the shared parse worker.
+  extractTextRoutes: extractJsTsTextRoutes,
+  extractToolDefinitions,
 });
 
 export const javascriptProvider = defineLanguage({
   id: SupportedLanguages.JavaScript,
-  extensions: ['.js', '.jsx'],
+  rename: typescriptRenameProvider,
+  extensions: ['.js', '.jsx', '.mjs', '.cjs'],
   entryPointPatterns: [/^use[A-Z]/],
   astFrameworkPatterns: [
     {
@@ -384,6 +513,12 @@ export const javascriptProvider = defineLanguage({
       entryPointMultiplier: 3.2,
       reason: 'nestjs-decorator',
       patterns: ['@Controller', '@Get', '@Post', '@Put', '@Delete', '@Patch'],
+    },
+    {
+      framework: 'trpc',
+      entryPointMultiplier: 3.0,
+      reason: 'trpc-procedure',
+      patterns: ['initTRPC', 'createTRPCRouter', '@trpc/server', '@trpc/client'],
     },
     {
       framework: 'expo-router',
@@ -402,6 +537,7 @@ export const javascriptProvider = defineLanguage({
   ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: JAVASCRIPT_QUERIES,
   typeConfig: typescriptConfig,
+  scopeOwnsReceivers: tsScopeOwnsReceivers,
   exportChecker: tsExportChecker,
   importResolver: createImportResolver(javascriptImportConfig),
   callExtractor: createCallExtractor(javascriptCallConfig),
@@ -411,6 +547,7 @@ export const javascriptProvider = defineLanguage({
     extractFunctionName: tsExtractFunctionName,
   }),
   variableExtractor: createVariableExtractor(javascriptVariableConfig),
+  definitionPropertiesExtractor: extractConvexEndpointProperties,
   classExtractor: createClassExtractor(javascriptClassConfig),
   // ── JSDoc → description (issue #2270). An exported decl is captured as the
   //    inner declaration; its JSDoc precedes the wrapping `export_statement`. ──
@@ -418,6 +555,14 @@ export const javascriptProvider = defineLanguage({
     wrapperNodeTypes: ['export_statement'],
   }),
   builtInNames: BUILT_INS,
+
+  // Member-assignment shapes — see the TypeScript provider above.
+  labelOverride: (functionNode, defaultLabel) =>
+    defaultLabel !== 'Function'
+      ? defaultLabel
+      : functionNode.type === 'assignment_expression'
+        ? memberAssignmentLabel(functionNode)
+        : defaultLabel,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
   // JavaScript is the fourth migration after Python, C#, and TypeScript.
@@ -435,4 +580,10 @@ export const javascriptProvider = defineLanguage({
   mergeBindings: (_scope, bindings) => jsMergeBindings(bindings),
   receiverBinding: jsReceiverBinding,
   arityCompatibility: jsArityCompatibility,
+  // See the TypeScript provider above.
+  extractDecoratorRoutes: extractJsTsRoutes,
+  extractFetchWrapperCalls,
+  // Content-based (not AST): tRPC procedure routers are scanned from source text.
+  extractTextRoutes: extractJsTsTextRoutes,
+  extractToolDefinitions,
 });

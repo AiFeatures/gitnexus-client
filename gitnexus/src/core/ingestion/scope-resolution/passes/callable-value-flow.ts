@@ -10,6 +10,7 @@ import type {
   CallableFlowInvokeSite,
   CallableFlowOperand,
   CallableFlowSite,
+  NodeLabel,
   ParsedFile,
   ScopeId,
   SymbolDefinition,
@@ -19,11 +20,30 @@ import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexe
 import type { GraphNodeLookup } from '../graph-bridge/node-lookup.js';
 import type { CalleeIdAccumulator } from '../graph-bridge/callee-id-sink.js';
 import { tryEmitEdgeWithExplicitTargetId } from '../graph-bridge/edges.js';
-import { resolveCallerGraphId, resolveDefGraphId } from '../graph-bridge/ids.js';
-import { resolveInheritanceBaseInScope } from '../scope/walkers.js';
+import {
+  resolveCallerGraphId,
+  resolveDefGraphId,
+  simpleQualifiedName,
+} from '../graph-bridge/ids.js';
+import {
+  resolveInheritanceBaseInScope,
+  lookupNameClaim,
+  findReceiverTypeBinding,
+} from '../scope/walkers.js';
+import { definitionIdPosition } from '../utils/definition-id.js';
 import { narrowOverloadCandidates } from './overload-narrowing.js';
 
-export const MAX_CALLABLE_VALUE_TARGETS = 32;
+/**
+ * Per-site dispatch-target cap. Above it the site is treated as overflowed and
+ * its edges are dropped — a cliff, so a repo with a legitimately wide dispatch
+ * table (33+ candidates on one callable site) loses the whole call chain.
+ *
+ * Override via `GITNEXUS_MAX_CALLABLE_VALUE_TARGETS` for such repos.
+ */
+export const MAX_CALLABLE_VALUE_TARGETS = (() => {
+  const env = Number(process.env.GITNEXUS_MAX_CALLABLE_VALUE_TARGETS);
+  return Number.isInteger(env) && env >= 1 ? env : 32;
+})();
 
 interface Target {
   readonly id: string;
@@ -66,6 +86,15 @@ export interface EmitCallableValueFlowInput {
   readonly isCallableValueTarget?: (def: SymbolDefinition) => boolean;
   readonly hasFileLocalCallableLinkage?: (def: SymbolDefinition) => boolean;
   readonly onWarn?: (warning: CallableValueFlowWarning) => void;
+  /** When set, skip a second `collectDeferredIndirectSites` walk. */
+  readonly deferredIndirectSites?: ReadonlySet<string>;
+  /** When set, skip a second `referenceSites` signature walk. */
+  readonly callSignaturesBySite?: ReadonlyMap<string, CallableFlowExpectedSignature>;
+}
+
+export interface DeferredIndirectCollection {
+  readonly sites: ReadonlySet<string>;
+  readonly callSignaturesBySite: ReadonlyMap<string, CallableFlowExpectedSignature>;
 }
 
 /** Position key shared with the existing free/reference skip-set contract. */
@@ -84,24 +113,47 @@ export function collectDeferredIndirectSites(
   parsedFiles: readonly ParsedFile[],
   scopes?: ScopeResolutionIndexes,
 ): ReadonlySet<string> {
+  return collectDeferredIndirectCollection(parsedFiles, scopes).sites;
+}
+
+/** One `referenceSites` walk for deferred keys and call-signature evidence. */
+export function collectDeferredIndirectCollection(
+  parsedFiles: readonly ParsedFile[],
+  scopes?: ScopeResolutionIndexes,
+): DeferredIndirectCollection {
   const out = new Set<string>();
+  const callSignaturesBySite = new Map<string, CallableFlowExpectedSignature>();
   const flowCells = new Set<string>();
   if (scopes !== undefined) {
     for (const parsed of parsedFiles) {
       for (const site of parsed.callableFlowSites ?? []) {
         const operand = flowCellOperand(site);
         if (operand !== undefined) {
-          flowCells.add(canonicalBindingKey(parsed.filePath, operand, scopes));
+          flowCells.add(
+            canonicalBindingKey(parsed.filePath, operand, scopes, site.kind !== 'store'),
+          );
         }
       }
     }
   }
   for (const parsed of parsedFiles) {
-    const canonical = new Set(
-      parsed.referenceSites
-        .filter((site) => site.kind === 'call')
-        .map((site) => callableFlowSiteKey(parsed.filePath, site.atRange)),
-    );
+    const canonical = new Set<string>();
+    for (const site of parsed.referenceSites) {
+      if (site.kind !== 'call') continue;
+      const key = callableFlowSiteKey(parsed.filePath, site.atRange);
+      canonical.add(key);
+      const signature: CallableFlowExpectedSignature = {
+        ...(site.arity !== undefined ? { parameterCount: site.arity } : {}),
+        ...(site.argumentTypes !== undefined ? { parameterTypes: site.argumentTypes } : {}),
+        ...(site.argumentTypeClasses !== undefined
+          ? { parameterTypeClasses: site.argumentTypeClasses }
+          : {}),
+      };
+      const previous = callSignaturesBySite.get(key);
+      if (previous === undefined || signatureEvidence(signature) > signatureEvidence(previous)) {
+        callSignaturesBySite.set(key, signature);
+      }
+    }
     for (const site of parsed.callableFlowSites ?? []) {
       if (site.kind !== 'invoke') continue;
       const key = callableFlowSiteKey(parsed.filePath, site.callSite);
@@ -116,7 +168,7 @@ export function collectDeferredIndirectSites(
       }
     }
   }
-  return out;
+  return { sites: out, callSignaturesBySite };
 }
 
 function flowCellOperand(site: CallableFlowSite): CallableFlowOperand | undefined {
@@ -140,7 +192,8 @@ function flowCellOperand(site: CallableFlowSite): CallableFlowOperand | undefine
 export function emitCallableValueFlow(input: EmitCallableValueFlowInput): CallableValueFlowResult {
   const facts: FileFact[] = [];
   const invokes: FileInvoke[] = [];
-  const canonicalInvokeKeys = collectDeferredIndirectSites(input.parsedFiles, input.scopes);
+  const canonicalInvokeKeys =
+    input.deferredIndirectSites ?? collectDeferredIndirectSites(input.parsedFiles, input.scopes);
   let unmatchedInvokes = 0;
   for (const parsed of input.parsedFiles) {
     for (const site of parsed.callableFlowSites ?? []) {
@@ -182,6 +235,8 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
 
   const bindingKey = (filePath: string, operand: CallableFlowOperand): string =>
     canonicalBindingKey(filePath, operand, input.scopes);
+  const destinationKey = (filePath: string, operand: CallableFlowOperand): string =>
+    canonicalBindingKey(filePath, operand, input.scopes, true);
   // Lexical binding lookup is suppressed ONLY for cells bound by formal
   // facts: a parameter whose grammar emits no declaration binding must not
   // adopt a same-named outer function. Value cells (copy/alias/store/load
@@ -192,7 +247,7 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
   const formalConstrainedBindings = new Set<string>();
   for (const fact of facts) {
     if (fact.site.kind === 'formal') {
-      formalConstrainedBindings.add(bindingKey(fact.filePath, fact.site.binding));
+      formalConstrainedBindings.add(destinationKey(fact.filePath, fact.site.binding));
     }
   }
 
@@ -396,7 +451,7 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
   // narrowing. No arbitrary first-overload choice is permitted.
   for (const fact of facts) {
     if (fact.site.kind !== 'seed') continue;
-    const destination = bindingKey(fact.filePath, fact.site.destination);
+    const destination = destinationKey(fact.filePath, fact.site.destination);
     const candidates = resolveSeedCandidates(
       fact.filePath,
       fact.site.destination.inScope,
@@ -456,7 +511,7 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
   for (const fact of facts) {
     if (fact.site.kind !== 'address') continue;
     addAddress(
-      bindingKey(fact.filePath, fact.site.destination),
+      destinationKey(fact.filePath, fact.site.destination),
       bindingKey(fact.filePath, fact.site.source),
       `address:${fact.filePath}:${fact.site.source.name}`,
     );
@@ -469,7 +524,7 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
     targetIndexes,
     aliasesByTargetId,
   );
-  const callSignaturesBySite = indexCallSignatures(input.parsedFiles);
+  const callSignaturesBySite = input.callSignaturesBySite ?? indexCallSignatures(input.parsedFiles);
   const dynamicCallees = new Map<string, Map<string, Target>>();
   const dynamicOverflow = new Set<string>();
   const dynamicTargetHistory = new Map<string, Set<string>>();
@@ -480,9 +535,9 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
     switch (site.kind) {
       case 'copy':
       case 'alias': {
+        const source = bindingKey(fact.filePath, site.source);
+        const destination = destinationKey(fact.filePath, site.destination);
         addWorkItem(() => {
-          const source = bindingKey(fact.filePath, site.source);
-          const destination = bindingKey(fact.filePath, site.destination);
           transferTargets(source, destination, context);
           transferAddresses(source, destination, context);
           if (site.kind === 'alias') {
@@ -493,8 +548,8 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
         break;
       }
       case 'load': {
+        const destination = destinationKey(fact.filePath, site.destination);
         addWorkItem(() => {
-          const destination = bindingKey(fact.filePath, site.destination);
           const reached = reachedCells(fact.filePath, site.pointer);
           if (reached.overflow) {
             markTargetOverflow(destination, context);
@@ -609,7 +664,7 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
       if (callOverflow) {
         for (const targetId of history ?? targetIds) {
           for (const formal of indexedFormals(targetId)) {
-            const formalKey = bindingKey(formal.filePath, formal.site.binding);
+            const formalKey = destinationKey(formal.filePath, formal.site.binding);
             markTargetOverflow(formalKey, `actual-formal-overflow:${callKey}`);
             markAddressOverflow(formalKey, `actual-formal-overflow:${callKey}`);
           }
@@ -622,7 +677,7 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
       const sourceTargets = operandTargets(fact.filePath, site.source);
       for (const targetId of targetIds) {
         for (const formal of indexedFormals(targetId)) {
-          const formalKey = bindingKey(formal.filePath, formal.site.binding);
+          const formalKey = destinationKey(formal.filePath, formal.site.binding);
           const context = `actual-formal:${callKey}:${site.parameterIndex}`;
           const contextualTargets = new Map(sourceTargets.targets);
           for (const target of resolveOperandCandidates(
@@ -738,33 +793,153 @@ export function emitCallableValueFlow(input: EmitCallableValueFlowInput): Callab
   return { emitted, resolvedInvokes, ambiguousInvokes, unmatchedInvokes, iterations };
 }
 
-function buildGraphTargetIndex(
+/**
+ * Pure — exported for `bench/callable-value-flow/measure.mjs`, which guards its
+ * scaling ratio and result fingerprint. Not part of the pass's public contract.
+ */
+export function buildGraphTargetIndex(
   scopes: ScopeResolutionIndexes,
   nodeLookup: GraphNodeLookup,
   providerTarget: ((def: SymbolDefinition) => boolean) | undefined,
   graph: KnowledgeGraph,
 ): ReadonlyMap<string, Target> {
   const out = new Map<string, Target>();
-  const byAnchor = buildGraphCallableAnchorIndex(graph);
+  const { byAnchor, callableByPosition } = buildGraphCallableIndexes(graph);
   for (const def of scopes.defs.byId.values()) {
-    if (!isCallable(def) && providerTarget?.(def) !== true) continue;
+    const callableDef = isCallable(def) || providerTarget?.(def) === true;
+    if (!callableDef) {
+      // #2693: a closure bound to a name (`val f = { }`) is a callable the def
+      // type cannot see — the scope layer declares it with its VALUE label
+      // (Kotlin/Swift `Property`, Dart `Variable`) while #2687 makes the graph
+      // emit a single callable node for it. Only the graph knows.
+      //
+      // The join MUST be positional. Resolving such a def through
+      // `resolveDefGraphId` is unsafe: every qualified key it builds embeds
+      // `def.type`, so for a value def they can only ever hit a value-labelled
+      // node — and when the def's own node is absent (Rust `let`) or carries a
+      // DIFFERENT label than the def's type (TypeScript declares `const` as
+      // `Variable` but emits a `Const` node), the chain falls through to the
+      // label-agnostic, first-write-wins `simpleKey(filePath, simpleName)`.
+      // That aliases the binding onto ANY same-named callable in the file —
+      // `const save = cb` next to an unrelated `Svc.save` mints a CALLS edge to
+      // the method, and the result depends on declaration order.
+      //
+      // A closure binding IS its callable node: same file, same line, same
+      // name. An aliasing local is not. So look the node up by position and
+      // admit only an exact hit.
+      const positionalKey = valueBindingPositionKey(def);
+      const positionalId =
+        positionalKey === undefined ? undefined : callableByPosition.get(positionalKey);
+      // `''` marks an ambiguous position (two callables claiming one
+      // file/line/name) — undecidable, so admit neither.
+      if (positionalId === undefined || positionalId === '') continue;
+      out.set(def.nodeId, { id: positionalId, def });
+      continue;
+    }
     const anchorKey = definitionAnchorKey(def);
     const anchored = anchorKey === undefined ? undefined : byAnchor.get(anchorKey);
     const id =
       anchored?.length === 1 ? anchored[0] : resolveDefGraphId(def.filePath, def, nodeLookup);
+    if (id === undefined) continue;
     // Overloads can intentionally share one graph node ID. Index by the
     // definition identity so contextual signature narrowing still sees the
     // complete overload set before a selected target collapses to graph ID.
-    if (id !== undefined) out.set(def.nodeId, { id, def });
+    out.set(def.nodeId, { id, def });
   }
   return out;
 }
+
+/**
+ * Leading sigils are part of a name in some grammars and stripped in others:
+ * PHP keeps `$` on a variable_name node (deliberately — it is what separates
+ * PHP's variable and function namespaces, so `$save` does not collide with
+ * `save()`), while the scope layer and the callable-flow synthesizer both
+ * normalise it away. The positional join has to see both sides the same way.
+ */
+const withoutSigil = (name: string): string => name.replace(/^[$@]+/, '');
+
+/**
+ * `file\0line\0name` for a value binding, matching the callable-node key built
+ * in `buildGraphCallableIndexes`. Definition lines come from the def id and are
+ * 1-based; graph `startLine` is 0-based, which is the `+ 1` there.
+ */
+function valueBindingPositionKey(def: SymbolDefinition): string | undefined {
+  if (!VALUE_BINDING_DEF_TYPES.has(def.type)) return undefined;
+  const line = definitionIdPosition(def.nodeId, def.filePath)?.line;
+  const name = simpleQualifiedName(def);
+  if (line === undefined || name === undefined) return undefined;
+  return `${def.filePath}\0${line}\0${withoutSigil(name)}`;
+}
+
+/**
+ * Value-binding labels whose initializer can be a callable. Admitted ONLY on
+ * positional graph-node evidence (see `buildGraphTargetIndex`), never on the def
+ * type alone.
+ *
+ * Deliberately NOT `isOwnableValueLabel` (scope/walkers.ts), which lists the
+ * same labels for the value-receiver bridge: that predicate is contracted to
+ * `reconcileOwnership`, and coupling the two would let a label added for
+ * ownership silently widen call-target admission. Two lists, two reasons —
+ * changing either means checking the other.
+ *
+ * `Static` is excluded: `normalizeNodeLabel` (scope-extractor.ts) has no
+ * `static` case, so no scope-resolution def can carry that type. Including it
+ * added an entry no fixture could ever exercise.
+ */
+const VALUE_BINDING_DEF_TYPES: ReadonlySet<NodeLabel> = new Set<NodeLabel>([
+  'Const',
+  'Property',
+  'Variable',
+]);
 
 interface CanonicalCallableTargets {
   /** Definition identity remains the key; declaration keys may point at the definition target. */
   readonly targets: ReadonlyMap<string, Target>;
   /** Prototype/declaration graph ids grouped by their canonical definition graph id. */
   readonly aliasesByTargetId: ReadonlyMap<string, readonly string[]>;
+}
+
+/** Reuse the flow pass's proven prototype/definition identities for source edits. */
+export function callableDeclarationFamilies(
+  scopes: ScopeResolutionIndexes,
+  graph: KnowledgeGraph,
+  nodeLookup: GraphNodeLookup,
+  hasFileLocalCallableLinkage: (def: SymbolDefinition) => boolean,
+  sourceQualifiedNames?: ReadonlyMap<string, string>,
+): ReadonlyMap<string, readonly SymbolDefinition[]> {
+  const original = buildGraphTargetIndex(scopes, nodeLookup, undefined, graph);
+  // A provider may retain a written declarator qualifier absent from the
+  // legacy graph identity. Keep that source fact local to this identity join.
+  const raw = sourceQualifiedNames
+    ? new Map(
+        [...original].map(([id, target]) => {
+          const qualifiedName = sourceQualifiedNames.get(id);
+          return [
+            id,
+            qualifiedName ? { ...target, def: { ...target.def, qualifiedName } } : target,
+          ];
+        }),
+      )
+    : original;
+  const canonical = canonicalizeCallableDeclarations(
+    raw,
+    buildCallableTargetIndexes(raw.values(), scopes),
+    scopes,
+    graph,
+    hasFileLocalCallableLinkage,
+  );
+  const groups = new Map<string, SymbolDefinition[]>();
+  for (const [id, target] of canonical.targets) {
+    const definition = original.get(id)?.def;
+    if (!definition) continue;
+    const group = groups.get(target.def.nodeId) ?? [];
+    group.push(definition);
+    groups.set(target.def.nodeId, group);
+  }
+  const families = new Map<string, readonly SymbolDefinition[]>();
+  for (const group of groups.values())
+    for (const definition of group) families.set(definition.nodeId, group);
+  return families;
 }
 
 /**
@@ -839,8 +1014,10 @@ function canonicalizeCallableDeclarations(
 }
 
 function definitionPosition(def: SymbolDefinition): string | undefined {
-  const match = def.nodeId.match(/#(\d+):(\d+):/);
-  return match === null ? undefined : `${def.filePath}\0${match[1]}\0${match[2]}`;
+  const position = definitionIdPosition(def.nodeId, def.filePath);
+  return position === undefined
+    ? undefined
+    : `${def.filePath}\0${position.line}\0${position.column}`;
 }
 
 function declarationSignatureCompatible(
@@ -874,10 +1051,24 @@ function declarationSignatureCompatible(
   return typeof declarationConst !== 'boolean' || declarationConst === definitionConst;
 }
 
-function buildGraphCallableAnchorIndex(
-  graph: KnowledgeGraph,
-): ReadonlyMap<string, readonly string[]> {
-  const out = new Map<string, string[]>();
+interface GraphCallableIndexes {
+  /** Callable graph nodes by `file\0label\0line\0name` — the definition anchor. */
+  readonly byAnchor: ReadonlyMap<string, readonly string[]>;
+  /**
+   * Callable graph nodes by `file\0line\0name` — the same anchor WITHOUT the
+   * label, because a value binding's def type never matches its callable node's
+   * label (that is the whole point of #2693). Value = the node id, or `''` when
+   * two callables claim one position and the join is undecidable.
+   *
+   * Derived in the same walk as `byAnchor`: a second pass over the graph for
+   * the same nodes would double the cost of the largest loop in this pass.
+   */
+  readonly callableByPosition: ReadonlyMap<string, string>;
+}
+
+function buildGraphCallableIndexes(graph: KnowledgeGraph): GraphCallableIndexes {
+  const byAnchor = new Map<string, string[]>();
+  const callableByPosition = new Map<string, string>();
   for (const node of graph.iterNodes()) {
     if (node.label !== 'Function' && node.label !== 'Method' && node.label !== 'Constructor') {
       continue;
@@ -892,16 +1083,22 @@ function buildGraphCallableAnchorIndex(
     ) {
       continue;
     }
-    const key = `${filePath}\0${node.label}\0${zeroBasedLine + 1}\0${name}`;
-    const bucket = out.get(key);
-    if (bucket === undefined) out.set(key, [node.id]);
+    const oneBasedLine = zeroBasedLine + 1;
+    const positionKey = `${filePath}\0${oneBasedLine}\0${withoutSigil(name)}`;
+    const existing = callableByPosition.get(positionKey);
+    // First wins would be order-dependent; mark the collision instead so an
+    // ambiguous position admits nothing rather than something arbitrary.
+    callableByPosition.set(positionKey, existing === undefined ? node.id : '');
+    const key = `${filePath}\0${node.label}\0${oneBasedLine}\0${name}`;
+    const bucket = byAnchor.get(key);
+    if (bucket === undefined) byAnchor.set(key, [node.id]);
     else bucket.push(node.id);
   }
-  return out;
+  return { byAnchor, callableByPosition };
 }
 
 function definitionAnchorKey(def: SymbolDefinition): string | undefined {
-  const line = def.nodeId.match(/#(\d+):(\d+):/)?.[1];
+  const line = definitionIdPosition(def.nodeId, def.filePath)?.line;
   const name = simpleName(def.qualifiedName);
   if (line === undefined || name === undefined) return undefined;
   return `${def.filePath}\0${def.type}\0${line}\0${name}`;
@@ -1105,58 +1302,60 @@ function lexicalCallableLookup(
   scopes: ScopeResolutionIndexes,
   graphTargets: ReadonlyMap<string, Target>,
 ): { readonly targets: Target[]; readonly shadowed: boolean } {
-  let current: ScopeId | null = operand.inScope;
-  const visited = new Set<ScopeId>();
-  while (current !== null && !visited.has(current)) {
-    visited.add(current);
-    const scope = scopes.scopeTree.getScope(current);
-    if (scope === undefined) return { targets: [], shadowed: false };
-    const refs = nearestScopeBindings(current, operand.name, scope.bindings, scopes);
-    if (refs.length > 0) {
-      const out: Target[] = [];
-      for (const ref of refs) {
-        const target = targetForDef(ref.def, graphTargets);
-        if (target !== undefined) out.push(target);
-      }
-      return { targets: dedupeTargets(out), shadowed: true };
-    }
-    current = scope.parent;
-  }
-  return { targets: [], shadowed: false };
-}
-
-function nearestScopeBindings(
-  scopeId: ScopeId,
-  name: string,
-  local: ReadonlyMap<string, readonly { readonly def: SymbolDefinition }[]>,
-  scopes: ScopeResolutionIndexes,
-): readonly { readonly def: SymbolDefinition }[] {
-  const out: { readonly def: SymbolDefinition }[] = [];
-  const seen = new Set<string>();
-  const add = (refs: readonly { readonly def: SymbolDefinition }[] | undefined): void => {
-    for (const ref of refs ?? []) {
-      if (seen.has(ref.def.nodeId)) continue;
-      seen.add(ref.def.nodeId);
-      out.push(ref);
-    }
-  };
-  add(local.get(name));
-  add(scopes.bindings.get(scopeId)?.get(name));
-  add(scopes.bindingAugmentations.get(scopeId)?.get(name));
-  if (out.length === 0 && scopes.scopeTree.getScope(scopeId)?.kind === 'Module') {
-    add(scopes.workspaceFqnBindings.get(name));
-    for (const namespace of scopes.accessibleNamespacesByScope.get(scopeId) ?? []) {
-      add(scopes.namespaceFqnBindings.get(namespace)?.get(name));
-    }
-  }
-  return out;
+  const claim = lookupNameClaim(operand.inScope, operand.name, scopes, {
+    position: operand.atRange.startLine > 0 ? operand.atRange : undefined,
+    purpose: 'value',
+  });
+  const targets = claim.bindings
+    .map((binding) => targetForDef(binding.def, graphTargets))
+    .filter((target): target is Target => target !== undefined);
+  return { targets: dedupeTargets(targets), shadowed: claim.status !== 'absent' };
 }
 
 function canonicalBindingKey(
   filePath: string,
   operand: CallableFlowOperand,
   scopes: ScopeResolutionIndexes,
+  destination = false,
 ): string {
+  let position = operand.atRange.startLine > 0 ? operand.atRange : undefined;
+  if (destination && position !== undefined) {
+    const destinationPosition = position;
+    // A declaration writes its own cell even before its initializer finishes.
+    // Only activate the declaration that contains this destination; an earlier
+    // assignment must not be redirected to an unrelated later declaration.
+    let owner: ScopeId | null = operand.inScope;
+    const seen = new Set<ScopeId>();
+    while (owner !== null && !seen.has(owner)) {
+      seen.add(owner);
+      const scope = scopes.scopeTree.getScope(owner);
+      if (scope === undefined) break;
+      const declaration = scope.nameClaims?.find(
+        (claim) =>
+          claim.name === operand.name &&
+          (claim.range.startLine < destinationPosition.startLine ||
+            (claim.range.startLine === destinationPosition.startLine &&
+              claim.range.startCol <= destinationPosition.startCol)) &&
+          (claim.range.endLine > destinationPosition.startLine ||
+            (claim.range.endLine === destinationPosition.startLine &&
+              claim.range.endCol >= destinationPosition.startCol)),
+      );
+      if (declaration !== undefined) {
+        if (declaration.availableFrom !== undefined) {
+          position = { ...operand.atRange, ...declaration.availableFrom };
+        }
+        break;
+      }
+      owner = scope.lookupPolicy?.parentScope ?? scope.parent;
+    }
+  }
+  const claim = lookupNameClaim(operand.inScope, operand.name, scopes, {
+    position,
+    purpose: 'value',
+  });
+  if (claim.scope !== undefined) {
+    return `${filePath}\0${claim.scope.id}\0${operand.name}`;
+  }
   let current: ScopeId | null = operand.inScope;
   const visited = new Set<ScopeId>();
   let enclosingFunction: ScopeId | undefined;
@@ -1165,9 +1364,6 @@ function canonicalBindingKey(
     const scope = scopes.scopeTree.getScope(current);
     if (scope === undefined) break;
     if (enclosingFunction === undefined && scope.kind === 'Function') enclosingFunction = current;
-    if (nearestScopeBindings(current, operand.name, scope.bindings, scopes).length > 0) {
-      return `${filePath}\0${current}\0${operand.name}`;
-    }
     current = scope.parent;
   }
   // Some grammars emit parameter type-bindings but no declaration binding.
@@ -1335,8 +1531,8 @@ function dedupeDefinitions(defs: readonly SymbolDefinition[]): SymbolDefinition[
 }
 
 function definitionStartsAt(def: SymbolDefinition, line: number, column: number): boolean {
-  const match = def.nodeId.match(/#(\d+):(\d+):/);
-  return match !== null && Number(match[1]) === line && Number(match[2]) === column;
+  const position = definitionIdPosition(def.nodeId, def.filePath);
+  return position !== undefined && position.line === line && position.column === column;
 }
 
 function expandMemberTargets(
@@ -1393,17 +1589,10 @@ function receiverType(
   operand: CallableFlowOperand,
   scopes: ScopeResolutionIndexes,
 ): string | undefined {
-  let current: ScopeId | null = operand.inScope;
-  const visited = new Set<ScopeId>();
-  while (current !== null && !visited.has(current)) {
-    visited.add(current);
-    const scope = scopes.scopeTree.getScope(current);
-    if (scope === undefined) return undefined;
-    const hit = scope.typeBindings.get(operand.name);
-    if (hit !== undefined) return hit.rawName;
-    current = scope.parent;
-  }
-  return scopes.workspaceTypeBindings.get(operand.name)?.rawName;
+  return findReceiverTypeBinding(operand.inScope, operand.name, scopes, {
+    position: operand.atRange.startLine > 0 ? operand.atRange : undefined,
+    purpose: 'value',
+  })?.rawName;
 }
 
 function targetForDef(

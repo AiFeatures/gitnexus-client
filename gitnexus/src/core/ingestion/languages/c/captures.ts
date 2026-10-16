@@ -11,6 +11,8 @@ import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 import { splitCInclude } from './import-decomposer.js';
 import { computeCDeclarationArity, computeCCallArity } from './arity-metadata.js';
 import { markStaticName } from './static-linkage.js';
+import { normalizeCppParamType } from '../cpp/arity-metadata.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
 import {
   synthesizeCallableFlowCaptures,
   type CallableCaptureSignature,
@@ -134,7 +136,16 @@ export function emitCScopeCaptures(
           grouped['@declaration.parameter-types'] = syntheticCapture(
             '@declaration.parameter-types',
             fnNode,
-            JSON.stringify(arity.parameterTypes),
+            // Headers use the C++ grammar; retain the same signature vocabulary.
+            JSON.stringify(arity.parameterTypes.map(normalizeCppParamType)),
+          );
+        }
+
+        if (arity.parameterTypeClasses !== undefined) {
+          grouped['@declaration.parameter-type-classes'] = syntheticCapture(
+            '@declaration.parameter-type-classes',
+            fnNode,
+            JSON.stringify(arity.parameterTypeClasses),
           );
         }
 
@@ -163,6 +174,12 @@ export function emitCScopeCaptures(
       }
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 

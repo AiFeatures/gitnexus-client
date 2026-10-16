@@ -67,6 +67,7 @@
  *   - No caching. Callers that want memoization can wrap this function.
  */
 
+import { lookupLexicalName } from '../name-claims.js';
 import type { NodeLabel } from '../../graph/types.js';
 import type { SymbolDefinition } from '../symbol-definition.js';
 import type {
@@ -74,8 +75,8 @@ import type {
   Callsite,
   DefId,
   LookupParams,
+  NameLookupOptions,
   Resolution,
-  Scope,
   ScopeId,
 } from '../types.js';
 import type { OriginForTieBreak } from '../origin-priority.js';
@@ -83,11 +84,14 @@ import { composeEvidence, confidenceFromEvidence, type RawSignals } from './evid
 import { compareByConfidenceWithTiebreaks, type TieBreakKey } from './tie-breaks.js';
 import { lookupQualified } from './lookup-qualified.js';
 import type { ArityVerdict, OwnerScopedContributor, RegistryContext } from './context.js';
+import { CLASS_KINDS } from './context.js';
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
 /** Extended `LookupParams` narrowing `ownerScopedContributor` to the concrete shape. */
 export interface CoreLookupParams extends Omit<LookupParams, 'ownerScopedContributor'> {
+  /** A separate namespace whose ownership is determined only by accepted kinds. */
+  readonly independentKindNamespace?: boolean;
   readonly ownerScopedContributor: OwnerScopedContributor | null;
   /** Call-site description forwarded to `arityCompatibility`. Optional — for non-call lookups. */
   readonly callsite?: Callsite;
@@ -108,15 +112,46 @@ export function lookupCore(
   const perCandidate = new Map<DefId, CandidateState>();
 
   // ── Step 1: lexical scope-chain walk ──────────────────────────────────
-  const lexicalShadowed = walkLexicalChain(name, startScope, acceptedKinds, ctx, perCandidate);
+  //
+  // SKIPPED for a NAMED explicit receiver. `recv.name` names a MEMBER of
+  // whatever `recv` denotes; it is not a lexical reference to `name`, so a
+  // binding of the bare tail name in an enclosing scope is never the right
+  // answer. Steps 2 and 3 (receiver type / owner members) are the routes.
+  //
+  // Without this, `options.baseUrl` bound to an unrelated function-local
+  // `const baseUrl` in the same file. This is the residual half of the defect
+  // JS/TS block scopes narrowed in #2699 — blocks moved nested-block locals
+  // off the chain, but a local declared directly in the function body stayed
+  // on it, and no amount of extra scopes reaches that case.
+  //
+  // `this` / `self` are deliberately EXEMPT. For a self-receiver the members
+  // and the lexical chain legitimately overlap — a class body is itself a
+  // scope that binds its members — so Step 1 is a real resolution route
+  // there, not a coincidence. Measured on a 762-file corpus: skipping Step 1
+  // for every explicit receiver dropped 711 edges, of which 43 were
+  // `this.member` reads reaching their own owner. Exempting the self names
+  // keeps those and still removes the 668 named-receiver false positives.
+  const skipLexical =
+    params.explicitReceiver !== undefined &&
+    !IMPLICIT_RECEIVERS.includes(params.explicitReceiver.name);
+  const lexicalShadowed = skipLexical
+    ? false
+    : walkLexicalChain(name, startScope, acceptedKinds, ctx, perCandidate, params);
 
   // ── Step 2: type-binding / MRO walk (methods/fields) ──────────────────
-  if (params.useReceiverTypeBinding && ctx.methodDispatch !== undefined) {
+  if (
+    (!lexicalShadowed || perCandidate.size > 0 || skipLexical) &&
+    params.useReceiverTypeBinding &&
+    ctx.methodDispatch !== undefined
+  ) {
     walkReceiverTypeBinding(name, startScope, acceptedKinds, params, ctx, perCandidate);
   }
 
   // ── Step 3: owner-scoped contributor ──────────────────────────────────
-  if (params.ownerScopedContributor !== null) {
+  if (
+    (!lexicalShadowed || perCandidate.size > 0 || skipLexical) &&
+    params.ownerScopedContributor !== null
+  ) {
     seedFromOwnerScopedContributor(
       name,
       params.ownerScopedContributor,
@@ -198,32 +233,48 @@ function walkLexicalChain(
   acceptedKinds: ReadonlySet<NodeLabel>,
   ctx: RegistryContext,
   perCandidate: Map<DefId, CandidateState>,
+  params: CoreLookupParams,
 ): boolean {
-  let currentId: ScopeId | null = startScope;
-  let depth = 0;
-  const visited = new Set<ScopeId>();
-
-  while (currentId !== null) {
-    if (visited.has(currentId)) return false;
-    visited.add(currentId);
-
-    const scope: Scope | undefined = ctx.scopes.getScope(currentId);
-    if (scope === undefined) return false;
-
-    const bindings = scope.bindings.get(name);
-    if (bindings !== undefined && bindings.length > 0) {
-      for (const binding of bindings) {
-        if (!acceptedKinds.has(binding.def.type)) continue;
-        recordLexicalHit(perCandidate, binding, depth);
+  if (params.independentKindNamespace === true) {
+    let id: ScopeId | null = startScope;
+    let depth = 0;
+    const visited = new Set<ScopeId>();
+    while (id !== null && !visited.has(id)) {
+      visited.add(id);
+      const scope = ctx.scopes.getScope(id);
+      if (scope === undefined) return true;
+      const bindings = (scope.bindings.get(name) ?? []).filter((binding) =>
+        acceptedKinds.has(binding.def.type),
+      );
+      if (bindings.length > 0) {
+        for (const binding of bindings) recordLexicalHit(perCandidate, binding, depth);
+        return true;
       }
-      return true; // hard shadow regardless of kind-filter survivorship
+      id = scope.lookupPolicy?.parentScope ?? scope.parent;
+      depth++;
     }
-
-    currentId = scope.parent;
-    depth++;
+    return id !== null;
   }
-
-  return false;
+  const options = { position: params.lookupPosition, purpose: params.lookupPurpose };
+  const claim = lookupName(ctx, startScope, name, options);
+  ctx.onLexicalClaim?.(name, claim);
+  if (claim.status !== 'absent') {
+    let depth = 0;
+    let owner = ctx.scopes.getScope(startScope);
+    const visited = new Set<ScopeId>();
+    while (owner !== undefined && owner.id !== claim.scope?.id && !visited.has(owner.id)) {
+      visited.add(owner.id);
+      const parent = owner.lookupPolicy?.parentScope ?? owner.parent;
+      owner = parent === null ? undefined : ctx.scopes.getScope(parent);
+      depth++;
+    }
+    for (const binding of claim.bindings) {
+      if (acceptedKinds.has(binding.def.type)) recordLexicalHit(perCandidate, binding, depth);
+    }
+    return true;
+  }
+  const rootName = name.split('.', 1)[0]!;
+  return rootName !== name && lookupName(ctx, startScope, rootName, options).status !== 'absent';
 }
 
 function recordLexicalHit(
@@ -286,49 +337,83 @@ function resolveReceiverOwner(
   // ready resolveTypeRef call (that module is separate), we do a direct
   // lookup and trust the caller to have populated the binding.
   if (params.explicitReceiver !== undefined) {
-    return lookupReceiverType(startScope, params.explicitReceiver.name, ctx);
+    return lookupReceiverType(startScope, params.explicitReceiver.name, ctx, params);
   }
 
   // Implicit `self` / `this` — the scope's typeBindings should carry it.
   for (const implicitName of IMPLICIT_RECEIVERS) {
-    const owner = lookupReceiverType(startScope, implicitName, ctx);
+    const owner = lookupReceiverType(startScope, implicitName, ctx, params);
     if (owner !== undefined) return owner;
   }
   return undefined;
 }
 
-const IMPLICIT_RECEIVERS: readonly string[] = Object.freeze(['self', 'this']);
+/**
+ * Names that denote the enclosing instance rather than an arbitrary object.
+ *
+ * Two consumers, and both want the same set: `resolveReceiverOwner` above
+ * tries them when no explicit receiver is present, and the Step-1 skip in
+ * `lookupCore` exempts them because for a SELF receiver the members and the
+ * lexical chain legitimately overlap — a class body is itself a scope that
+ * binds its members — whereas for a named receiver they never do.
+ *
+ * `$this` is matched because the receiver name arrives as the reference node's
+ * RAW SOURCE TEXT (`extractExplicitReceiver` returns `cap.text` verbatim), so
+ * PHP's `$this->x` presents as `"$this"`, sigil included. Listing the spelling
+ * keeps this a data table rather than a language switch — this module resolves
+ * language behaviour through `providers.*` and `params` only (see the header)
+ * — and it follows the ingestion-side twin, `THIS_RECEIVERS` in
+ * `gitnexus/src/core/ingestion/type-env.ts`, which has always listed the
+ * sigil'd spelling rather than stripping it. Stripping would carry the same
+ * false-positive surface anyway (a JS variable literally named `$this`).
+ *
+ * That twin also lists `Me`, deliberately NOT mirrored here: no entry in
+ * `SupportedLanguages` uses it, so it can only ever exempt a variable that
+ * happens to be called `Me`. The two lists are otherwise the same set, and
+ * that equality — plus the `Me` exemption in both directions — is now ENFORCED
+ * by `gitnexus/test/unit/receiver-twin-list-drift.test.ts`. Editing either list
+ * without the other fails there.
+ */
+const IMPLICIT_RECEIVERS: readonly string[] = Object.freeze(['self', 'this', '$this']);
+
+function lookupName(
+  ctx: RegistryContext,
+  scope: ScopeId,
+  name: string,
+  options: NameLookupOptions,
+) {
+  return (
+    ctx.lexicalLookup?.(scope, name, options) ??
+    lookupLexicalName(scope, name, { scopes: ctx.scopes }, options)
+  );
+}
 
 function lookupReceiverType(
   startScope: ScopeId,
   receiverName: string,
   ctx: RegistryContext,
+  params: CoreLookupParams,
 ): DefId | undefined {
-  let currentId: ScopeId | null = startScope;
-  const visited = new Set<ScopeId>();
-  while (currentId !== null) {
-    if (visited.has(currentId)) return undefined;
-    visited.add(currentId);
-
-    const scope = ctx.scopes.getScope(currentId);
-    if (scope === undefined) return undefined;
-
-    const typeRef = scope.typeBindings.get(receiverName);
-    if (typeRef !== undefined) {
-      // rawName must resolve to a def via qualifiedNames; if it doesn't, we
-      // can't claim the receiver type. No fallback — that's what
-      // `resolveTypeRef` would do, but we keep this path lean and let
-      // callers pre-resolve if they want the richer semantics.
-      const candidateIds = ctx.qualifiedNames.get(typeRef.rawName);
-      if (candidateIds.length === 1) return candidateIds[0];
-      // Ambiguous (≥ 2) or missing (0) — caller must pre-resolve via
-      // `resolveTypeRef` (#916) if they want the richer semantics. We
-      // intentionally do NOT re-implement a simple-name fallback here.
-      return undefined;
-    }
-    currentId = scope.parent;
+  const claim = lookupName(ctx, startScope, receiverName, {
+    position: params.lookupPosition,
+    purpose: 'value',
+  });
+  const typeRef = claim.typeBinding;
+  if (typeRef === undefined) return undefined;
+  const typeClaim = lookupName(ctx, typeRef.declaredAtScope, typeRef.rawName, {
+    position: typeRef.lookupPosition,
+    purpose: typeRef.lookupPurpose ?? 'type',
+  });
+  if (typeClaim.status !== 'absent') {
+    const candidates = new Map(
+      typeClaim.bindings
+        .filter((binding) => CLASS_KINDS.includes(binding.def.type))
+        .map((binding) => [binding.def.nodeId, binding.def]),
+    );
+    return candidates.size === 1 ? candidates.keys().next().value : undefined;
   }
-  return undefined;
+  const candidateIds = ctx.qualifiedNames.get(typeRef.rawName);
+  return candidateIds.length === 1 ? candidateIds[0] : undefined;
 }
 
 function collectOwnedMembers(

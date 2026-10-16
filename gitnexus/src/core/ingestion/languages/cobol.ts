@@ -12,6 +12,8 @@
  */
 import { SupportedLanguages } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
+import { collectCobolSourceCfgs } from './cobol/flow.js';
+import { cobolRenameProvider } from './cobol/rename.js';
 import {
   emitCobolScopeCaptures,
   interpretCobolImport,
@@ -22,7 +24,7 @@ import {
 export const cobolProvider = defineLanguage({
   id: SupportedLanguages.Cobol,
   parseStrategy: 'standalone',
-  extensions: [], // COBOL files detected by cobol-processor's isCobolFile/isJclFile
+  extensions: ['.cbl', '.cob', '.cobol', '.cpy', '.copybook'],
   entryPointPatterns: [],
   astFrameworkPatterns: [],
   treeSitterQueries: '',
@@ -33,15 +35,23 @@ export const cobolProvider = defineLanguage({
   },
   exportChecker: () => false,
   importResolver: () => null,
+  rename: cobolRenameProvider,
 
-  // No `cfgVisitor`: COBOL is the deliberate non-goal of the PDG-language
-  // rollout (#2195). There is no installed tree-sitter grammar and COBOL's
-  // PERFORM / GO-TO control flow is exotic; the worker's `provider.cfgVisitor &&`
-  // gate therefore emits no CFG/PDG layer for COBOL (see worker-roundtrip.test.ts).
+  // Standalone source provider: program regions preserve paragraph fallthrough
+  // and PERFORM return continuations without introducing an AST dependency.
+  collectSourceCfgs: collectCobolSourceCfgs,
 
   // ── Scope-resolution hooks ───────────────────────────────────────
   emitScopeCaptures: emitCobolScopeCaptures,
   interpretImport: interpretCobolImport,
+  // `COPY` is a pure textual splice by the copybook preprocessor — the
+  // `#include` case exactly, and COBOL's only import form. It is spliced before
+  // anything runs, so a copybook cycle built from `COPY` statements is real and
+  // must not be tagged `runsOnlyWhenCalled` by the central Pass-3 position rule.
+  //
+  // Procedure scopes include their bodies, so COPY inside a paragraph must
+  // still retain its textual-splice semantics.
+  importsExecuteWhereWritten: false,
   importOwningScope: cobolImportOwningScope,
   receiverBinding: cobolReceiverBinding,
 });

@@ -38,7 +38,12 @@ import { generateId } from '../../../../lib/utils.js';
 import { dartProvider } from '../dart.js';
 import { dartArityCompatibility, dartMergeBindings, resolveDartImportTarget } from './index.js';
 import { decodeMarker } from '../../utils/heritage-marker.js';
+import { typeApplicationArguments } from '../../utils/template-arguments.js';
+import type { HeritageTypeArgumentSink } from '../../scope-resolution/utils/generic-instantiation.js';
 import { expandDartWildcardNames } from './expand-wildcards.js';
+import { dartIsGlobalNameFallbackPlausible } from './name-fallback-visibility.js';
+import { captureDartPackageConfig, loadDartPackageConfig } from './package-config.js';
+import { emitDartPackageDependencies } from './package-dependencies.js';
 
 interface ClassDefRef {
   readonly graphId: string;
@@ -77,6 +82,7 @@ function emitDartHeritageEdges(
   graph: KnowledgeGraph,
   parsedFiles: readonly ParsedFile[],
   nodeLookup: GraphNodeLookup,
+  recordTypeArguments?: HeritageTypeArgumentSink,
 ): void {
   const defsByName = new Map<string, ClassDefRef[]>();
   for (const parsed of parsedFiles) {
@@ -110,10 +116,19 @@ function emitDartHeritageEdges(
       if (decoded?.kind !== 'heritage') continue;
       const parts = decoded.fields;
       if (parts.length < 3) continue;
-      const [kind, baseName, childName] = parts;
+      const [kind, baseName, childName, rawTypeArguments] = parts;
       const childId = pickClassByName(childName!, parsed.filePath, defsByName);
       const baseId = pickClassByName(baseName!, parsed.filePath, defsByName);
       if (childId === undefined || baseId === undefined || childId === baseId) continue;
+      // The instantiation this clause was written with — `implements
+      // Validator<String>` (#2912). Recorded before the dedup below, since the
+      // FIRST writer wins on both sides and an edge deduped here still needs
+      // its arguments. A marker from a pre-#2912 cache has no fourth field,
+      // which reads as unknown.
+      if (rawTypeArguments !== undefined) {
+        const typeArguments = typeApplicationArguments(rawTypeArguments);
+        if (typeArguments !== undefined) recordTypeArguments?.(childId, baseId, typeArguments);
+      }
       const key = `${childId}->${baseId}:${kind}`;
       if (emitted.has(key)) continue;
       emitted.add(key);
@@ -186,8 +201,16 @@ export const dartScopeResolver: ScopeResolver = {
   languageProvider: dartProvider,
   importEdgeReason: 'dart-scope: import',
 
-  resolveImportTarget: (targetRaw, fromFile, allFilePaths) =>
-    resolveDartImportTarget(targetRaw, fromFile, allFilePaths),
+  loadResolutionConfig: loadDartPackageConfig,
+  captureResolutionConfig: captureDartPackageConfig,
+  // Package dependencies use cached ParsedFile facts, never raw source text.
+  postExtractSourceTextPolicy: 'uncached-files',
+  emitPostResolutionEdges: (graph, parsedFiles, _nodeLookup, _indexes, ctx) =>
+    emitDartPackageDependencies(graph, parsedFiles, ctx.resolutionConfig),
+  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig) =>
+    resolveDartImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
+
+  isNamespaceImport: (parsedImport) => parsedImport.kind === 'namespace',
 
   // Dart `import` is whole-library: every public top-level symbol of the
   // target enters scope. Enumerating them lets `propagateImportedReturnTypes`
@@ -211,8 +234,8 @@ export const dartScopeResolver: ScopeResolver = {
 
   // `implements` / `with` IMPLEMENTS edges (extends rides the generic
   // inherits pre-pass; these need an explicit, kind-independent edge type).
-  emitHeritageEdges: (graph, parsedFiles, nodeLookup) =>
-    emitDartHeritageEdges(graph, parsedFiles, nodeLookup),
+  emitHeritageEdges: (graph, parsedFiles, nodeLookup, _scopes, recordTypeArguments) =>
+    emitDartHeritageEdges(graph, parsedFiles, nodeLookup, recordTypeArguments),
 
   // Dart is statically typed — the field-fallback heuristic over-connects.
   fieldFallbackOnMethodLookup: false,
@@ -221,5 +244,6 @@ export const dartScopeResolver: ScopeResolver = {
   // No `new`: bare `Foo()` resolves to the type; with cross-file imports the
   // callee is reachable workspace-wide.
   allowGlobalFreeCallFallback: true,
+  isGlobalNameFallbackPlausible: dartIsGlobalNameFallbackPlausible,
   constructorCallTargetsClass: true,
 };

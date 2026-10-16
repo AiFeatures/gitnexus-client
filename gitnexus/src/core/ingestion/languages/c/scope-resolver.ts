@@ -4,10 +4,16 @@ import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js
 import { populateClassOwnedMembers } from '../../scope-resolution/scope/walkers.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
 import { cProvider } from '../c-cpp.js';
-import { cArityCompatibility, cMergeBindings, resolveCImportTarget } from './index.js';
-import { scanHeaderFiles } from './header-scan.js';
+import { cArityCompatibility, cMergeBindings } from './index.js';
+import { cIncludeLookupFromConfig, resolveCImportTarget } from './import-target.js';
+import {
+  C_HEADER_EXTENSIONS,
+  cFamilyImportFiles,
+  loadCFamilyResolutionConfig,
+} from './resolution-config.js';
 import { expandCWildcardNames, isStaticName, clearStaticNames } from './static-linkage.js';
 import { applyCStaticLinkageSideChannel } from './capture-side-channel.js';
+import { perFileSet } from '../../import-resolvers/per-file-set.js';
 
 /**
  * Per-pass memo of the augmented `#include`-resolution file set
@@ -19,31 +25,26 @@ import { applyCStaticLinkageSideChannel } from './capture-side-channel.js';
  * handing it a new set identity each time. Both `allFilePaths` (built once in
  * scope-resolution `run.ts`) and the header set (`loadResolutionConfig`
  * result) are stable per pass, so the union is built once and reused.
- * `WeakMap`-keyed → reclaimed with the pass (no cross-pass staleness).
+ * Reclaimed with the pass (no cross-pass staleness).
+ *
+ * Two inputs, so two levels of `perFileSet` composed rather than a second
+ * primitive: the outer memo's value is the inner memo, and a function is an
+ * object, which is all `T extends object` asks for.
+ *
+ * The MEMO stays private to this file even though the C++ resolver's twin is
+ * byte-identical. The augmented set's IDENTITY is load-bearing downstream —
+ * C++ delegates to `resolveCImportTarget`, whose `suffixIndex` memo is keyed on
+ * exactly this set — so one memo shared across the two languages would hand
+ * each the other's index. Same builder-shared/memo-separate rule as
+ * `import-resolvers/pass-cache.ts`.
  */
-const augmentedPathsByPass = new WeakMap<
-  ReadonlySet<string>,
-  WeakMap<ReadonlySet<string>, ReadonlySet<string>>
->();
-
-function augmentedFilePaths(
-  allFilePaths: ReadonlySet<string>,
-  headerPaths: ReadonlySet<string>,
-): ReadonlySet<string> {
-  let byHeaders = augmentedPathsByPass.get(allFilePaths);
-  if (byHeaders === undefined) {
-    byHeaders = new WeakMap();
-    augmentedPathsByPass.set(allFilePaths, byHeaders);
-  }
-  let augmented = byHeaders.get(headerPaths);
-  if (augmented === undefined) {
+const augmentedFilePathsFor = perFileSet((allFilePaths: ReadonlySet<string>) =>
+  perFileSet((headerPaths: ReadonlySet<string>): ReadonlySet<string> => {
     const set = new Set(allFilePaths);
     for (const h of headerPaths) set.add(h);
-    augmented = set;
-    byHeaders.set(headerPaths, augmented);
-  }
-  return augmented;
-}
+    return set;
+  }),
+);
 
 /**
  * C `ScopeResolver` registered in `SCOPE_RESOLVERS` and consumed by
@@ -65,7 +66,7 @@ export const cScopeResolver: ScopeResolver = {
     // Clear stale static-linkage data from any previous invocation to
     // prevent cross-repo contamination in server-mode scenarios.
     clearStaticNames();
-    return scanHeaderFiles(repoPath);
+    return loadCFamilyResolutionConfig(repoPath, C_HEADER_EXTENSIONS);
   },
 
   // Worker-boundary restore (see `ScopeResolver.applyCaptureSideChannel`).
@@ -85,19 +86,25 @@ export const cScopeResolver: ScopeResolver = {
   // this process. Runs BEFORE `populateOwners`.
   applyCaptureSideChannel: applyCStaticLinkageSideChannel,
 
-  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig) => {
+  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig, context) => {
     // Augment allFilePaths with .h files discovered via loadResolutionConfig
     // since the phase only passes .c files to the C resolver but #include
-    // targets .h files classified as C++ in language detection.
-    const headerPaths = resolutionConfig as ReadonlySet<string> | undefined;
-    if (headerPaths !== undefined && headerPaths.size > 0) {
-      return resolveCImportTarget(
-        targetRaw,
-        fromFile,
-        augmentedFilePaths(allFilePaths, headerPaths),
-      );
-    }
-    return resolveCImportTarget(targetRaw, fromFile, allFilePaths);
+    // targets .h files classified as C++ in language detection. A raw header
+    // Set (the import-target bench) is the same shape with empty search paths.
+    // The augmented set is the memo key — pass it through, never copy it.
+    const { files, config } = cFamilyImportFiles(
+      allFilePaths,
+      resolutionConfig,
+      augmentedFilePathsFor(allFilePaths),
+    );
+    const parsed = context?.parsedImport;
+    const isSystem = parsed?.kind === 'wildcard' && parsed.isSystem === true;
+    return resolveCImportTarget(
+      targetRaw,
+      fromFile,
+      files,
+      cIncludeLookupFromConfig(config, isSystem),
+    );
   },
 
   expandsWildcardTo: (targetModuleScope, parsedFiles) =>

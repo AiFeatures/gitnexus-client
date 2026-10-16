@@ -9,12 +9,18 @@ import {
   tagNamespacePrefixes,
 } from '../../scope-resolution/scope/walkers.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
+import { extractElementTypeFromString } from '../../type-extractors/shared.js';
 import { cppProvider } from '../c-cpp.js';
 import { cppArityCompatibility } from './arity.js';
 import { CPP_CONVERSION_ONLY_ARG_TYPE_PREFIXES, cppConversionRank } from './conversion-rank.js';
 import { cppMergeBindings } from './merge-bindings.js';
 import { resolveCppImportTarget } from './import-target.js';
-import { scanCppHeaderFiles } from './header-scan.js';
+import { cIncludeLookupFromConfig } from '../c/import-target.js';
+import {
+  CPP_HEADER_EXTENSIONS,
+  cFamilyImportFiles,
+  loadCFamilyResolutionConfig,
+} from '../c/resolution-config.js';
 import {
   expandCppWildcardNames,
   isFileLocal,
@@ -29,6 +35,10 @@ import {
   isCppDependentBaseMember,
 } from './two-phase-lookup.js';
 import { populateCppAssociatedNamespaces, clearCppAdlState, pickCppAdlCandidates } from './adl.js';
+import {
+  findCallableBindingsAndAdlBlocker,
+  populateCppIncludedOverloads,
+} from './callable-bindings.js';
 import { applyCppCaptureSideChannel } from './capture-side-channel.js';
 import {
   clearCppInlineNamespaces,
@@ -46,6 +56,18 @@ import {
   clearCppMemberLookupState,
   resolveCppReceiverMember,
 } from './member-lookup.js';
+import { stripCppSpecifiers } from './interpret.js';
+import { perFileSet } from '../../import-resolvers/per-file-set.js';
+import {
+  clearCppUsingDeclarations,
+  populateCppIncludedUsingClaims,
+  populateCppUsingBindings,
+} from './using-bindings.js';
+
+/** A pointee worth binding: a bare identifier, not `T**`, `T[]`, `A::B` or a
+ *  template spelling. Hoisted — a literal here would mint a fresh RegExp on
+ *  every subscript the resolver folds. */
+const CPP_SIMPLE_POINTEE_RE = /^[A-Za-z_]\w*$/;
 
 /**
  * Per-pass memo of the augmented `#include`-resolution file set
@@ -54,32 +76,25 @@ import {
  * a fresh ~F-entry `Set` on every call AND defeated the shared
  * `resolveCImportTarget` suffix-index memo (in `c/import-target.ts`) by handing
  * it a new set identity each time. Both inputs are stable per pass, so the
- * union is built once and reused. `WeakMap`-keyed → reclaimed with the pass.
- * (Twin of the C resolver's `augmentedFilePaths`.)
+ * union is built once and reused. Reclaimed with the pass.
+ *
+ * Two inputs, so two levels of `perFileSet` composed rather than a second
+ * primitive: the outer memo's value is the inner memo, and a function is an
+ * object, which is all `T extends object` asks for.
+ *
+ * (Twin of the C resolver's `augmentedFilePathsFor`.) The two memos stay
+ * SEPARATE deliberately. C++ delegates to `resolveCImportTarget`, whose
+ * `suffixIndex` memo is keyed on the augmented set, so a single memo shared
+ * with C would hand each language the other's index — same
+ * builder-shared/memo-separate rule as `import-resolvers/pass-cache.ts`.
  */
-const augmentedPathsByPass = new WeakMap<
-  ReadonlySet<string>,
-  WeakMap<ReadonlySet<string>, ReadonlySet<string>>
->();
-
-function augmentedFilePaths(
-  allFilePaths: ReadonlySet<string>,
-  headerPaths: ReadonlySet<string>,
-): ReadonlySet<string> {
-  let byHeaders = augmentedPathsByPass.get(allFilePaths);
-  if (byHeaders === undefined) {
-    byHeaders = new WeakMap();
-    augmentedPathsByPass.set(allFilePaths, byHeaders);
-  }
-  let augmented = byHeaders.get(headerPaths);
-  if (augmented === undefined) {
+const augmentedFilePathsFor = perFileSet((allFilePaths: ReadonlySet<string>) =>
+  perFileSet((headerPaths: ReadonlySet<string>): ReadonlySet<string> => {
     const set = new Set(allFilePaths);
     for (const h of headerPaths) set.add(h);
-    augmented = set;
-    byHeaders.set(headerPaths, augmented);
-  }
-  return augmented;
-}
+    return set;
+  }),
+);
 
 /**
  * C++ `ScopeResolver` registered in `SCOPE_RESOLVERS` and consumed by
@@ -109,22 +124,27 @@ export const cppScopeResolver: ScopeResolver = {
     clearCppInlineNamespaces();
     clearCppUserDefinedConversions();
     clearCppMemberLookupState();
-    return scanCppHeaderFiles(repoPath);
+    clearCppUsingDeclarations();
+    return loadCFamilyResolutionConfig(repoPath, CPP_HEADER_EXTENSIONS);
   },
 
-  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig) => {
-    // Augment allFilePaths with header files discovered via loadResolutionConfig.
-    // C++ .h/.hpp/.hxx/.hh files may be classified differently by language
-    // detection but are importable from .cpp files via #include.
-    const headerPaths = resolutionConfig as ReadonlySet<string> | undefined;
-    if (headerPaths !== undefined && headerPaths.size > 0) {
-      return resolveCppImportTarget(
-        targetRaw,
-        fromFile,
-        augmentedFilePaths(allFilePaths, headerPaths),
-      );
-    }
-    return resolveCppImportTarget(targetRaw, fromFile, allFilePaths);
+  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig, context) => {
+    // Same adapter as C, with this file's own augmented-set memo. C++
+    // `#include` then goes through `resolveCppImportTarget`, whose suffix
+    // index is also private to C++.
+    const { files, config } = cFamilyImportFiles(
+      allFilePaths,
+      resolutionConfig,
+      augmentedFilePathsFor(allFilePaths),
+    );
+    const parsed = context?.parsedImport;
+    const isSystem = parsed?.kind === 'wildcard' && parsed.isSystem === true;
+    return resolveCppImportTarget(
+      targetRaw,
+      fromFile,
+      files,
+      cIncludeLookupFromConfig(config, isSystem),
+    );
   },
 
   expandsWildcardTo: (targetModuleScope, parsedFiles) =>
@@ -197,6 +217,24 @@ export const cppScopeResolver: ScopeResolver = {
     populateCppDependentBases(parsedFiles);
   },
 
+  populateWorkspaceReferences: (parsedFiles, context) => {
+    const allFilePaths = new Set(parsedFiles.map((parsed) => parsed.filePath));
+    populateCppIncludedUsingClaims(parsedFiles, (parsed, imported) =>
+      cppScopeResolver.resolveImportTarget(
+        imported.targetRaw,
+        parsed.filePath,
+        allFilePaths,
+        context.resolutionConfig,
+        { parsedFiles, parsedImport: imported },
+      ),
+    );
+  },
+
+  populateNamespaceSiblings: (parsedFiles, indexes) => {
+    populateCppUsingBindings(parsedFiles, indexes);
+    populateCppIncludedOverloads(indexes);
+  },
+
   // Simple `isSuperReceiver` returns false for C++. Real super
   // classification is caller-context-dependent and lives in
   // `isSuperReceiverInContext` below — without scope context the
@@ -245,6 +283,29 @@ export const cppScopeResolver: ScopeResolver = {
     if (lhsDef.nodeId === enclosing.nodeId) return false;
     const mro = scopes.methodDispatch.mroFor(enclosing.nodeId);
     return mro.includes(lhsDef.nodeId);
+  },
+
+  // Subscript route only — C++ collection views are method calls.
+  //
+  // Two container spellings reach a subscript. A POINTER is one of them: `p[i]`
+  // on a `User*` is pointer arithmetic yielding a `User`, so the trailing `*` is
+  // peeled here rather than by `stripTypePreservingDecoration` (C++ declares
+  // none) — and peeling it at a bare class lookup instead would be wrong, since
+  // that is the route by which `p->m()` must keep seeing `User`'s own members.
+  // The other is a template container (`std::vector<User>`), left to the shared
+  // extractor.
+  //
+  // Fed the annotation AS WRITTEN, since `normalizeCppTypeName` strips both the
+  // star and the array brackets at capture. `undefined` = "not a container", so
+  // an `operator[]`-bearing class does not fold `grid[0]` onto `Grid`.
+  elementTypeOf: (containerType, via) => {
+    if (via.kind !== 'index') return undefined;
+    const t = stripCppSpecifiers(containerType);
+    if (t.endsWith('*')) {
+      const pointee = t.slice(0, -1).trim();
+      return CPP_SIMPLE_POINTEE_RE.test(pointee) ? pointee : undefined;
+    }
+    return extractElementTypeFromString(t);
   },
 
   // C++ is statically typed — disable field fallback heuristic
@@ -323,43 +384,8 @@ export const cppScopeResolver: ScopeResolver = {
   // specializations with explicit type arguments contribute associated
   // namespaces. Function-pointer args and full conversion-ranking remain
   // excluded.
-  resolveAdlCandidates: (site, callerParsed, scopes, parsedFiles) => {
-    // `using ns::name;` introduces `name` into ordinary unqualified lookup.
-    // For template-class method bodies, lexical scope walks can miss this
-    // named-using visibility; recover by resolving the imported namespace
-    // member directly when the local call name matches a named using import.
-    const usingNamedHits: SymbolDefinition[] = [];
-    const seenUsing = new Set<string>();
-    for (const imp of callerParsed.parsedImports) {
-      if (imp.kind !== 'named') continue;
-      if (imp.localName !== site.name) continue;
-      const member = resolveCppQualifiedNamespaceMember(
-        imp.targetRaw,
-        imp.importedName,
-        parsedFiles,
-        scopes,
-      );
-      if (member === undefined || member === 'ambiguous') continue;
-      if (seenUsing.has(member.nodeId)) continue;
-      seenUsing.add(member.nodeId);
-      usingNamedHits.push(member);
-    }
-    const adlHits = pickCppAdlCandidates(site, callerParsed, scopes, parsedFiles);
-    if (usingNamedHits.length === 0) return adlHits;
-    if (adlHits === undefined || adlHits.length === 0) return usingNamedHits;
-    const merged: SymbolDefinition[] = [];
-    const seen = new Set<string>();
-    for (const hit of usingNamedHits) {
-      seen.add(hit.nodeId);
-      merged.push(hit);
-    }
-    for (const hit of adlHits) {
-      if (seen.has(hit.nodeId)) continue;
-      seen.add(hit.nodeId);
-      merged.push(hit);
-    }
-    return merged;
-  },
+  resolveAdlCandidates: pickCppAdlCandidates,
+  resolveOrdinaryCallables: findCallableBindingsAndAdlBlocker,
 
   // C++ qualified namespace-member resolution (U5 of plan 2026-05-13-001).
   // Handles `outer::foo()` where `outer` is a namespace (not a class).

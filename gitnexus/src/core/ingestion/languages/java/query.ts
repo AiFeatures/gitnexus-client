@@ -58,20 +58,26 @@ const JAVA_SCOPE_QUERY = `
 (compact_constructor_declaration) @scope.function
 
 ;; Declarations — types
+;; Optional-quantifier capture rather than a second pattern: a separate rule
+;; would make every GENERIC declaration match twice under one def id, leaving
+;; match order to decide which twin kept the parameters.
 (class_declaration
-  name: (identifier) @declaration.name) @declaration.class
+  name: (identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.class
 
 (interface_declaration
-  name: (identifier) @declaration.name) @declaration.interface
+  name: (identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.interface
 
 (enum_declaration
   name: (identifier) @declaration.name) @declaration.enum
 
 (record_declaration
-  name: (identifier) @declaration.name) @declaration.record
+  name: (identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.record
 
 (annotation_type_declaration
-  name: (identifier) @declaration.name) @declaration.class
+  name: (identifier) @declaration.name) @declaration.annotation
 
 ;; Class annotation syntax is carried to post-resolution enrichment. Keeping
 ;; this in the existing scope query avoids a second AST build/traversal.
@@ -83,7 +89,13 @@ const JAVA_SCOPE_QUERY = `
     ])) @class-annotation.class
 
 ;; Declarations — methods / constructors
+;;
+;; A generic METHOD's parameters are read for the same reason a generic type's
+;; are (#2912 review): \`<T> boolean runAny(Validator<T> v)\` writes a receiver
+;; whose argument is a type VARIABLE, and a pass that cannot tell that from a
+;; concrete type prunes every implementor from the call's dispatch fan-out.
 (method_declaration
+  type_parameters: (type_parameters)? @declaration.type-parameters
   name: (identifier) @declaration.name) @declaration.method
 
 (constructor_declaration
@@ -113,6 +125,11 @@ const JAVA_SCOPE_QUERY = `
 
 (formal_parameter
   type: (scoped_type_identifier) @type-binding.type
+  name: (identifier) @type-binding.name) @type-binding.parameter
+
+;; Primitive parameters own their lexical name even though they have no class target.
+(formal_parameter
+  type: [(integral_type) (floating_point_type) (boolean_type)] @type-binding.type
   name: (identifier) @type-binding.name) @type-binding.parameter
 
 ;; Type bindings — local variable annotations: User u = new User();

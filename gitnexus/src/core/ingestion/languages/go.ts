@@ -1,3 +1,4 @@
+import { goRenameProvider } from './go/rename.js';
 /**
  * Go Language Provider
  *
@@ -26,6 +27,9 @@ import { createMethodExtractor } from '../method-extractors/generic.js';
 import { goMethodConfig } from '../method-extractors/configs/go.js';
 import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { goVariableConfig } from '../variable-extractors/configs/go.js';
+import { extractGoGinEchoRoutes } from '../route-extractors/go-gin-echo.js';
+import { resolveGoRouteHandler } from './go/route-handler.js';
+import { goPackageDir } from './go/package-clause.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { goCallConfig } from '../call-extractors/configs/go.js';
 import {
@@ -89,8 +93,12 @@ const GO_BUILT_INS: ReadonlySet<string> = new Set([
 ]);
 
 export const goProvider = defineLanguage({
+  rename: goRenameProvider,
   id: SupportedLanguages.Go,
   extensions: ['.go'],
+  // Package members resolve without imports. Include internal/external test
+  // packages conservatively for invalidation, including when a file is gone.
+  incrementalResolutionGroup: goPackageDir,
   entryPointPatterns: [/Handler$/, /^Serve/, /^New[A-Z]/, /^Make[A-Z]/],
   astFrameworkPatterns: [
     {
@@ -137,6 +145,8 @@ export const goProvider = defineLanguage({
   callExtractor: createCallExtractor(goCallConfig),
   fieldExtractor: createFieldExtractor(goFieldConfig),
   methodExtractor: createMethodExtractor(goMethodConfig),
+  resolveDetachedOwnerName: (node) =>
+    node.type === 'method_declaration' ? goMethodConfig.extractOwnerName?.(node) : undefined,
   variableExtractor: createVariableExtractor(goVariableConfig),
   classExtractor: createClassExtractor(goClassConfig),
   // ── godoc (`//` leading comments) → description (issue #2270). Build/tool
@@ -144,8 +154,20 @@ export const goProvider = defineLanguage({
   descriptionExtractor: createLeadingDocDescriptionExtractor({
     lineCommentPrefixes: ['//'],
     lineDirectivePrefixes: ['//go:', '// +build', '//nolint', '//line'],
+    // #2837: Go type declarations anchor on the `type_spec`, whose
+    // `previousNamedSibling` is null for the ordinary `type T struct{…}` form —
+    // the godoc comment is a sibling of the enclosing `type_declaration`, one
+    // level up. Without this the doc silently vanished for EVERY Go struct and
+    // interface (measured: pre-#2837 `desc=YES`, post `none`), taking #2270's
+    // description out of both the embedding header and the FTS column.
+    // Functions/methods are unaffected — they anchor on their own declaration
+    // node, which does carry the comment as a previous sibling.
+    wrapperNodeTypes: ['type_declaration'],
   }),
   builtInNames: GO_BUILT_INS,
+  // gin / echo verb registrations with in-function Group prefixes (#3402).
+  extractDecoratorRoutes: extractGoGinEchoRoutes,
+  resolveRouteHandler: resolveGoRouteHandler,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks ──────────
   emitScopeCaptures: emitGoScopeCaptures,

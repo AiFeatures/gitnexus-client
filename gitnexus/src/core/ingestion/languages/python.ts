@@ -44,6 +44,11 @@ import {
 } from './python/index.js';
 import { extractDjangoRoutes } from '../route-extractors/django.js';
 import { discoverDjangoRootUrls } from '../route-extractors/django-root-discovery.js';
+import { extractPythonModuleConstants } from '../route-extractors/python-const-resolver.js';
+import { pythonDecoratorRouteHandlerName } from '../route-extractors/python-decorator-handler.js';
+import { assertCloneable } from '../workers/clone-safety.js';
+import { collectPythonCaptureSideChannel } from './python/module-accessors.js';
+import { pythonRenameProvider } from './python/rename.js';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   'print',
@@ -105,7 +110,8 @@ function normalizePythonStringLiteral(text: string): string | undefined {
 
 export const pythonProvider = defineLanguage({
   id: SupportedLanguages.Python,
-  extensions: ['.py'],
+  rename: pythonRenameProvider,
+  extensions: ['.py', '.ipynb'],
   entryPointPatterns: [/^app$/, /^(get|post|put|delete|patch)_/i, /^api_/, /^view_/],
   astFrameworkPatterns: [
     {
@@ -142,6 +148,7 @@ export const pythonProvider = defineLanguage({
     discoverDjangoRootUrls(files, contentMap, reader),
   extractRoutes: (tree, filePath, reader, parser) =>
     parser ? extractDjangoRoutes(tree, filePath, parser, reader) : [],
+  decoratorRouteHandlerName: pythonDecoratorRouteHandlerName,
   labelOverride: pythonFunctionDefinitionLabel,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
@@ -149,6 +156,8 @@ export const pythonProvider = defineLanguage({
   // full per-hook rationale and the canonical capture vocabulary in
   // ./python/query.ts (PYTHON_SCOPE_QUERY constant).
   emitScopeCaptures: emitPythonScopeCaptures,
+  collectCaptureSideChannel: (filePath) =>
+    assertCloneable(collectPythonCaptureSideChannel(filePath)),
   cfgVisitor: createPythonCfgVisitor(),
   interpretImport: interpretPythonImport,
   interpretTypeBinding: interpretPythonTypeBinding,
@@ -158,4 +167,17 @@ export const pythonProvider = defineLanguage({
   receiverBinding: pythonReceiverBinding,
   arityCompatibility: pythonArityCompatibility,
   resolveImportTarget: resolvePythonImportTarget,
+
+  // ── #2391 constant harvest, provider-hook form (#2980): module-level string
+  // constants + from-imports for non-literal decorator route paths. Bare-name
+  // refs fold through the shared resolver (no foldRoutePathOperands needed).
+  // No `moduleConstantHeuristic`: Python harvests unconditionally, exactly as
+  // #2391 shipped it. A content gate was tried here and removed on review — it
+  // required `NAME` immediately followed by `=`, so it silently dropped the two
+  // idiomatic typed-FastAPI shapes (`API: str = "/api"`,
+  // `API: Final[str] = "/api"`) and every composed constant whose RHS starts
+  // with an identifier (`USERS = BASE + "/users"`), i.e. it REGRESSED routes
+  // that already resolve on main. The worker treats a missing heuristic as
+  // default-open; only Java opts into a gate, where the cost actually bites.
+  extractModuleConstants: extractPythonModuleConstants,
 });

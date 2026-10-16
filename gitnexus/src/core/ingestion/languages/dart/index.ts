@@ -9,7 +9,10 @@
  *   - `query.ts`             — tree-sitter scope query + lazy parser/query
  *   - `captures.ts`          — `emitDartScopeCaptures` orchestrator
  *   - `interpret.ts`         — capture-match → `ParsedImport` / `ParsedTypeBinding`
- *   - `import-target.ts`     — `(targetRaw, fromFile, allFilePaths) → file path`
+ *   - `import-target.ts`     — exact declared-package / relative import targets
+ *   - `package-uri.ts`       — shared `package:name/...` parse
+ *   - `package-config.ts`    — bounded, ignore-aware in-repo pubspec discovery
+ *   - `package-dependencies.ts` — manifest dependencies for incremental writeback
  *   - `receiver-binding.ts`  — synthesize `this` / `super` type-bindings
  *   - `signature-bindings.ts`— synthesize parameter / return type-bindings
  *   - `arity.ts`             — Dart arity compatibility (count-primary)
@@ -20,7 +23,7 @@
  *   - `cache-stats.ts`       — PROF_SCOPE_RESOLUTION cache hit/miss counters
  */
 
-export { emitDartScopeCaptures } from './captures.js';
+export { emitDartScopeCaptures, dartScopeOwnsReceivers } from './captures.js';
 export { getDartCaptureCacheStats, resetDartCaptureCacheStats } from './cache-stats.js';
 export {
   interpretDartImport,

@@ -23,6 +23,7 @@ describe('uninstallCommand', () => {
   let tempHome: string;
   let originalHome: string | undefined;
   let originalUserProfile: string | undefined;
+  let originalCodexHome: string | undefined;
   let originalSkillsRoot: string | undefined;
   let originalExitCode: typeof process.exitCode;
   let skillsRoot: string;
@@ -35,6 +36,8 @@ describe('uninstallCommand', () => {
 
     originalHome = process.env.HOME;
     originalUserProfile = process.env.USERPROFILE;
+    originalCodexHome = process.env.CODEX_HOME;
+    delete process.env.CODEX_HOME;
     originalSkillsRoot = process.env.GITNEXUS_TEST_SKILLS_ROOT;
     originalExitCode = process.exitCode;
 
@@ -57,6 +60,8 @@ describe('uninstallCommand', () => {
     vi.restoreAllMocks();
     process.env.HOME = originalHome;
     process.env.USERPROFILE = originalUserProfile;
+    if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalCodexHome;
     if (originalSkillsRoot === undefined) delete process.env.GITNEXUS_TEST_SKILLS_ROOT;
     else process.env.GITNEXUS_TEST_SKILLS_ROOT = originalSkillsRoot;
     // The command sets process.exitCode=1 on partial failure; restore it so a
@@ -203,6 +208,52 @@ describe('uninstallCommand', () => {
     expect(result).toContain('command = "other"');
   });
 
+  it('dry-runs and removes only the active CODEX_HOME MCP entry', async () => {
+    const activeHome = path.join(tempHome, 'active-codex');
+    const activeConfig = path.join(activeHome, 'config.toml');
+    const defaultConfig = path.join(tempHome, '.codex', 'config.toml');
+    const activeHooks = path.join(activeHome, 'hooks.json');
+    const defaultHooks = path.join(tempHome, '.codex', 'hooks.json');
+    const activeScriptDir = path.join(activeHome, 'hooks', 'gitnexus');
+    const defaultScriptDir = path.join(tempHome, '.codex', 'hooks', 'gitnexus');
+    const activeRaw = '[mcp_servers.gitnexus]\ncommand = "active"\n';
+    const defaultRaw = '[mcp_servers.gitnexus]\ncommand = "default"\n';
+    const hooksRaw = JSON.stringify({
+      hooks: {
+        PreToolUse: [
+          { matcher: 'Bash', hooks: [{ type: 'command', command: 'node gitnexus-hook.cjs' }] },
+          { matcher: 'Read', hooks: [{ type: 'command', command: 'user-hook' }] },
+        ],
+      },
+    });
+    await fs.mkdir(activeHome);
+    await fs.mkdir(path.dirname(defaultConfig));
+    await fs.mkdir(activeScriptDir, { recursive: true });
+    await fs.mkdir(defaultScriptDir, { recursive: true });
+    await fs.writeFile(activeConfig, activeRaw);
+    await fs.writeFile(defaultConfig, defaultRaw);
+    await fs.writeFile(activeHooks, hooksRaw);
+    await fs.writeFile(defaultHooks, hooksRaw);
+    process.env.CODEX_HOME = activeHome;
+
+    const uninstallCommand = await importUninstall();
+    await uninstallCommand();
+    expect(vi.mocked(console.log).mock.calls.flat().join('\n')).toContain(activeConfig);
+    expect(vi.mocked(console.log).mock.calls.flat().join('\n')).toContain(activeHooks);
+    expect(await fs.readFile(activeConfig, 'utf-8')).toBe(activeRaw);
+    expect(await fs.readFile(activeHooks, 'utf-8')).toBe(hooksRaw);
+
+    await uninstallCommand({ force: true });
+    expect(await fs.readFile(activeConfig, 'utf-8')).not.toContain('[mcp_servers.gitnexus]');
+    expect(await fs.readFile(defaultConfig, 'utf-8')).toBe(defaultRaw);
+    const remaining = JSON.parse(await fs.readFile(activeHooks, 'utf-8'));
+    expect(remaining.hooks.PreToolUse).toHaveLength(1);
+    expect(remaining.hooks.PreToolUse[0].hooks[0].command).toBe('user-hook');
+    expect(await fs.readFile(defaultHooks, 'utf-8')).toBe(hooksRaw);
+    await expect(fs.access(activeScriptDir)).rejects.toThrow();
+    await expect(fs.access(defaultScriptDir)).resolves.toBeUndefined();
+  });
+
   it('leaves a corrupt JSON config untouched', async () => {
     const claudeJson = path.join(tempHome, '.claude.json');
     const corrupt = '{ not valid json !!!';
@@ -312,6 +363,59 @@ describe('uninstallCommand', () => {
     const config = JSON.parse(await fs.readFile(opencodeJson, 'utf-8'));
     expect(config.mcp.gitnexus).toBeUndefined();
     expect(config.mcp.other).toEqual({ type: 'local', command: ['foo'] });
+  });
+
+  it.each(['opencode.jsonc', 'config.json'])(
+    'removes the gitnexus entry from OpenCode %s, preserving comments',
+    async (fileName) => {
+      const configPath = path.join(tempHome, '.config', 'opencode', fileName);
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      await fs.writeFile(
+        configPath,
+        [
+          '{',
+          '  // keep this comment',
+          '  "mcp": {',
+          '    "gitnexus": { "type": "local", "command": ["gitnexus", "mcp"] },',
+          '    "other": { "type": "local", "command": ["foo"] }',
+          '  }',
+          '}',
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const uninstallCommand = await importUninstall();
+      await uninstallCommand({ force: true });
+
+      const raw = await fs.readFile(configPath, 'utf-8');
+      expect(raw).toContain('keep this comment');
+      expect(raw).not.toContain('"gitnexus"');
+      expect(raw).toContain('"other"');
+    },
+  );
+
+  it('leaves OpenCode config.jsonc untouched because OpenCode does not read it', async () => {
+    const configJsonc = path.join(tempHome, '.config', 'opencode', 'config.jsonc');
+    await fs.mkdir(path.dirname(configJsonc), { recursive: true });
+    await fs.writeFile(
+      configJsonc,
+      [
+        '{',
+        '  // keep this comment',
+        '  "mcp": {',
+        '    "gitnexus": { "type": "local", "command": ["gitnexus", "mcp"] },',
+        '    "other": { "type": "local", "command": ["foo"] }',
+        '  }',
+        '}',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const uninstallCommand = await importUninstall();
+    await uninstallCommand({ force: true });
+
+    const raw = await fs.readFile(configJsonc, 'utf-8');
+    expect(raw).toContain('"gitnexus"');
   });
 
   // ── Antigravity MCP + hooks (AfterTool / gitnexus-antigravity-hook) ──

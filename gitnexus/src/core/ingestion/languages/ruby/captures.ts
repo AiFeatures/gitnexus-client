@@ -1,4 +1,5 @@
 import type { Capture, CaptureMatch } from 'gitnexus-shared';
+import { recordRubyMemberDispatch } from './member-dispatch.js';
 import {
   findChild,
   nodeIfType,
@@ -15,6 +16,7 @@ import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
 import { splitQualifiedName } from '../../utils/qualified-name.js';
 import { encodeMarker } from '../../utils/heritage-marker.js';
 import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
 
 const FUNCTION_NODE_TYPES = ['method', 'singleton_method'] as const;
 const HERITAGE_CALL_NAMES: ReadonlySet<string> = new Set(['include', 'extend', 'prepend']);
@@ -50,6 +52,7 @@ const RUBY_CALLABLE_CAPTURE_OPTIONS = {
   // Ruby (`action = process` stores process's RETURN value) — only explicit
   // reference forms (method(:x), &:x, lambda/proc) reference the callable.
   bareNamesAreCalls: true,
+  valueAlternatives: (node: SyntaxNode) => rubyValueAlternatives(node),
   extractCallableReference: (node: SyntaxNode) => {
     if (node.type !== 'call') return undefined;
     const method = node.childForFieldName('method');
@@ -63,6 +66,40 @@ const RUBY_CALLABLE_CAPTURE_OPTIONS = {
     return name.length === 0 ? undefined : { name, anchor: symbol };
   },
 } as const;
+
+/**
+ * Branches of a statement-bodied `if` / `unless` / `elsif` (#3354). They field
+ * `condition` / `consequence` / `alternative` like a ternary, but their
+ * branches are `then` / `else` STATEMENT LISTS, so the shared ternary rule
+ * would dig an identifier out of whichever statement it found (`g = h; 0`
+ * flowed `h`, although the branch evaluates to `0`). A branch holding one
+ * statement is that statement's value. A longer branch is skipped: it adds
+ * no alternative, while the other branches still flow. Every alternative
+ * emitted is a value the conditional really evaluates to, so skipping cannot
+ * add an edge. It only drops the skipped branch's own value. The `elsif`
+ * chain is walked here, so one multi-statement `elsif` no longer hides the
+ * branches after it. When no branch is a single statement, the whole
+ * conditional stays one opaque source. The `c ? a : b` ternary
+ * (`conditional`) is left to the shared rule.
+ */
+function rubyValueAlternatives(node: SyntaxNode): readonly SyntaxNode[] | undefined {
+  if (node.type !== 'if' && node.type !== 'unless' && node.type !== 'elsif') return undefined;
+  const branches: SyntaxNode[] = [];
+  for (let link: SyntaxNode | null = node; link !== null; ) {
+    const consequence: SyntaxNode | null = link.childForFieldName('consequence');
+    const alternative: SyntaxNode | null = link.childForFieldName('alternative');
+    link = alternative?.type === 'elsif' ? alternative : null;
+    for (const branch of [consequence, link === null ? alternative : null]) {
+      if (branch === null) continue;
+      const statements = branch.namedChildren.filter(
+        (child): child is SyntaxNode => child !== null && child.type !== 'comment',
+      );
+      const [statement] = statements;
+      if (statements.length === 1 && statement !== undefined) branches.push(statement);
+    }
+  }
+  return branches.length > 0 ? branches : [node];
+}
 
 /**
  * Build the full `.`-joined qualified owner name for a heritage/attr call by
@@ -92,6 +129,147 @@ function buildEnclosingQualifiedName(callNode: SyntaxNode): string | undefined {
   return segments.length > 0 ? segments.join('.') : undefined;
 }
 
+/**
+ * Does this `@ivar` write land on an INSTANCE of the enclosing LEXICAL class?
+ *
+ * In Ruby an instance variable belongs to whatever `self` is at the point of
+ * the write, so this is really a question about `self`, and `self` is an
+ * instance of the enclosing lexical class only inside an ordinary `def` whose
+ * own definition site is that class's body. Every other arrangement writes an
+ * ivar some instance of this class will never see:
+ *
+ *   class C
+ *     @shared = Outer.new        # class body:       self == C
+ *     def self.build             # singleton_method: self == C
+ *       @pool = Outer.new
+ *     end
+ *     class << self              # singleton_class:  self == C
+ *       def warm; @cache = Outer.new; end
+ *     end
+ *     Other.class_eval do        # block receiver:   self == Other
+ *       def warm; @far = Outer.new; end
+ *     end
+ *     other.instance_eval { @alien = Outer.new }   # self == other
+ *     def run; @pool.inner; end  # reads nil — @pool was never set on an instance
+ *   end
+ *
+ * So the walk stops on the FIRST ancestor that decides who `self` is, and
+ * answers true only for an ordinary `method` reached without crossing any
+ * boundary that could have moved `self` elsewhere. `method` alone is NOT
+ * sufficient — a `def` nested in a `class << self` body, or in a `class_eval`
+ * block, is reached through a `method` node first — hence the flag rather than
+ * an early return (#2807).
+ *
+ * ── WHY BLOCKS ARE A HARD STOP, WITHOUT LOOKING AT THE CALL THEY BELONG TO ──
+ *
+ * A block is the one construct whose `self` (and whose "default definee", the
+ * class a `def` inside it attaches to) is chosen by its RECEIVER, not by its
+ * syntax. `Foo.class_eval do … end`, `Class.new do … end`, `Struct.new(:x) do …
+ * end`, `Data.define(:x) do … end`, `Module.new`, `refine`, `define_method`,
+ * `instance_eval`, `instance_exec`, `module_eval` and `class_exec` all rebind
+ * it; `[1].each do … end` does not.
+ *
+ * Telling those apart would need an enumeration of every method that rebinds a
+ * block's `self`, and that set is OPEN: any user-defined method can do it to a
+ * block it merely receives —
+ *
+ *   def helper(&blk) = Foo.class_eval(&blk)
+ *   helper { def warm; @far = Outer.new; end }   # attaches to Foo, not here
+ *
+ * — so no allow-list of "safe" call names is sound, and a deny-list of known
+ * rebinders is exactly the incomplete enumeration that produced this bug. The
+ * only complete answer available from the block's own syntax is that ownership
+ * is unprovable, so every block boundary is a stop. That over-discards a plain
+ * `each`/`tap` block, whose `self` really is the instance; per the safety
+ * doctrine (see `scope-resolution/passes/compound-receiver.ts`) a missed edge is
+ * the acceptable cost and a fabricated edge on the wrong class is not.
+ *
+ * A `class` / `module` keyword nested INSIDE a block still terminates the walk
+ * with a true answer, and correctly so: that keyword sets the definee lexically
+ * no matter what surrounds it, so `Class.new do class Inner; def m; @a = …`
+ * writes a real `Inner` instance field.
+ *
+ * ── FORMS THAT CANNOT REACH HERE AT ALL ────────────────────────────────────
+ *
+ * `obj.instance_variable_set(:@a, Outer.new)` is a `call`, not an `assignment`,
+ * and `Foo.class_eval "def warm; @a = Outer.new; end"` hides its body in a
+ * `string` node. Neither parses into the `(assignment left: (instance_variable)
+ * …)` pattern in query.ts, so neither ever produces the marker this gate reads.
+ *
+ * Deliberately conservative. A write this returns false for simply binds no
+ * type at all, which costs at most a missed edge; returning true too eagerly
+ * invents a call from a receiver that is always nil.
+ */
+function isRubyInstanceIvarWrite(ivarNode: SyntaxNode | undefined): boolean {
+  if (ivarNode === undefined) return false;
+  let insideMethodBody = false;
+  for (let ancestor = ivarNode.parent; ancestor !== null; ancestor = ancestor.parent) {
+    switch (ancestor.type) {
+      // `def self.x` / `def obj.x`, and `class << self` / `class << obj`.
+      case 'singleton_method':
+      case 'singleton_class':
+        return false;
+      // Every block body: `do … end` and `{ … }` are the only two the grammar
+      // produces. `lambda` (`->`) always wraps its body in one of them, so it
+      // can never be the first boundary today — it is listed because the
+      // boundary IS the lambda, and a grammar change must not silently
+      // un-guard it.
+      case 'do_block':
+      case 'block':
+      case 'lambda':
+        return false;
+      // `BEGIN { … }` / `END { … }` are program-level bodies whose execution is
+      // relocated out of the enclosing method (before the program, and at exit);
+      // Ruby warns when they appear in a method body at all. Rather than assert
+      // whose `self` runs them, the doctrine applies: unprovable, so discard.
+      // Reachable — tree-sitter parses `END { @a = Outer.new }` inside a `def`
+      // as an `end_block` under that method's body.
+      case 'begin_block':
+      case 'end_block':
+        return false;
+      case 'method':
+        insideMethodBody = true;
+        break;
+      // The owning body. Reaching it without crossing any of the boundaries
+      // above means the write is an instance write exactly when a `def` body
+      // enclosed it.
+      case 'class':
+      case 'module':
+      case 'program':
+        return insideMethodBody;
+      // Everything else is control flow that cannot move `self`: `if`/`unless`
+      // (`then`), `case`/`when`, `while`, `for`/`do`, `begin`/`rescue`/`ensure`.
+      default:
+        break;
+    }
+  }
+  return false;
+}
+
+/** Whether an ordinary `def` has a provable lexical class/module definee. */
+function isRubyLexicalMethod(node: SyntaxNode): boolean {
+  if (node.type !== 'method') return false;
+  for (let ancestor = node.parent; ancestor !== null; ancestor = ancestor.parent) {
+    switch (ancestor.type) {
+      // Singleton bodies choose a different definee. A block's receiver can
+      // also rebind it, including through user helpers (see the ivar gate).
+      case 'singleton_method':
+      case 'singleton_class':
+      case 'do_block':
+      case 'block':
+      case 'lambda':
+      case 'begin_block':
+      case 'end_block':
+        return false;
+      case 'class':
+      case 'module':
+      case 'program':
+        return true;
+    }
+  }
+  return false;
+}
+
 export function emitRubyScopeCaptures(
   sourceText: string,
   _filePath: string,
@@ -118,6 +296,7 @@ export function emitRubyScopeCaptures(
     throw scopeExtractionError('scope query', _filePath, err);
   }
 
+  recordRubyMemberDispatch(tree.rootNode, _filePath);
   const out: CaptureMatch[] = [];
 
   for (const m of rawMatches) {
@@ -136,6 +315,25 @@ export function emitRubyScopeCaptures(
     }
     if (Object.keys(grouped).length === 0) continue;
 
+    // A tree-sitter pattern cannot say "and no singleton ancestor", so the
+    // ownership test is a walk and the whole binding is dropped here when `self`
+    // is the class object rather than an instance.
+    //
+    // Dropping the MARKER alone is not enough, and the class-body shape is why:
+    // with the marker gone `rubyBindingScopeFor` declines to hoist and the
+    // binding falls back to its innermost scope — which for `@shared = Outer.new`
+    // written straight in the class body already IS the Class scope. It would
+    // arrive at the wrong place by default. Discarding the match is the only
+    // uniform answer, and it costs nothing that existed before: these ivar
+    // patterns are new in #2807, so a class-object ivar simply goes back to
+    // binding nothing, exactly as it did before the pattern was added.
+    if (
+      grouped['@type-binding.ivar-field'] !== undefined &&
+      !isRubyInstanceIvarWrite(nodeMap['@type-binding.ivar-field'])
+    ) {
+      continue;
+    }
+
     // Decompose require/require_relative/load into import captures
     if (grouped['@import.statement'] !== undefined) {
       const anchor = grouped['@import.statement']!;
@@ -147,6 +345,12 @@ export function emitRubyScopeCaptures(
           continue;
         }
       }
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
       out.push(grouped);
       continue;
     }
@@ -159,6 +363,12 @@ export function emitRubyScopeCaptures(
         const receiver = synthesizeRubyReceiverBinding(fnNode, enclosingNode);
         if (receiver !== null) out.push(receiver);
       }
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
       out.push(grouped);
       continue;
     }
@@ -179,6 +389,17 @@ export function emitRubyScopeCaptures(
           if (nameCap !== undefined) {
             grouped['@declaration.name'] = nameCap;
           }
+        }
+
+        // Preserve AST classification across declaration.function → method
+        // reclassification. Parsing the source prefix here would confuse
+        // `def target.target` with an ordinary def and miss comments after def.
+        if (isRubyLexicalMethod(fnNode)) {
+          grouped['@declaration.lexical-method'] = syntheticCapture(
+            '@declaration.lexical-method',
+            fnNode,
+            'true',
+          );
         }
 
         const arity = computeRubyDeclarationArity(fnNode);
@@ -204,6 +425,12 @@ export function emitRubyScopeCaptures(
           );
         }
       }
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
       out.push(grouped);
       continue;
     }
@@ -304,6 +531,12 @@ export function emitRubyScopeCaptures(
       }
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 
@@ -624,6 +857,17 @@ function decomposeRubyImport(callNode: SyntaxNode, anchor: Capture): CaptureMatc
   }
 
   if (sourcePath === '') return null;
+
+  // require_relative always resolves from this file, including a bare sibling
+  // spelling. Preserve that distinction for the provider's import resolver.
+  if (
+    methodName === 'require_relative' &&
+    !sourcePath.startsWith('./') &&
+    !sourcePath.startsWith('../') &&
+    !sourcePath.startsWith('/')
+  ) {
+    sourcePath = `./${sourcePath}`;
+  }
 
   const segments = sourcePath.replace(/\\/g, '/').split('/');
   const lastSegment = segments[segments.length - 1]!;
